@@ -1,5 +1,6 @@
 package com.teamuhi.superbenemies.entity.dummy.ai
 
+import com.teamuhi.superbenemies.entity.boss.common.ai.SkyExposure
 import com.teamuhi.superbenemies.entity.dummy.HumanoidDummyEntity
 import net.minecraft.core.BlockPos
 import net.minecraft.world.entity.ai.goal.Goal
@@ -14,12 +15,14 @@ import kotlin.math.hypot
  * that is: `hideFromBosses` is on and a live, uncrippled boss is within [DummyAi.BOSS_RANGE] blocks. The dummy soldier
  * also wants cover for a while after a hit, or when it is out of missiles.
  *
- * Cover is a standable spot with a roof: the height map's top blocking block (leaves count) is at least two blocks
- * above the dummy's head. The search is sampled, not exhaustive, and only runs when a boss shows up or the current
- * cover is lost (never every tick):
- *  - [SAMPLES] random columns within [SEARCH_RADIUS] blocks, each resolved to the first standable spot near the dummy's height,
- *  - ranked by distance minus a bonus for thick cover (solid blocks within [THICKNESS_SCAN] above),
- *  - tried best first: a candidate with no path, or that was not reached in time, falls through to the next.
+ * Cover is the nearest standable spot with a roof: at least one block that stops the bosses seeing down
+ * ([SkyExposure.blocksSight]: stone, slabs, doors; not glass, leaves or fences) somewhere above the dummy's head, the
+ * same test the boss' DYNAMIC targeting uses, so a spot that hides the dummy from the goal also hides it from the boss.
+ * The search only runs when a boss shows up or the current cover is lost (never every tick):
+ *  - the columns around the dummy are walked nearest first (a pre-sorted disc of [SEARCH_RADIUS] blocks), each resolved
+ *    to the first standable spot near the dummy's height that has a roof,
+ *  - the search stops after [MAX_CANDIDATES] spots, which are then ordered by distance,
+ *  - tried nearest first: a candidate with no path, or that was not reached in time, falls through to the next.
  * Chunks are read with `getChunkNow`, so the search never loads or generates terrain.
  *
  * Phases: SEEK (sprint to the chosen spot) -> COVER (stand still, crouch now and then, the look goal keeps the boss in
@@ -51,17 +54,30 @@ class DummyHideGoal(private val dummy: HumanoidDummyEntity) : Goal() {
     override fun requiresUpdateEveryTick(): Boolean = true
 
     override fun canUse(): Boolean {
-        if (!dummy.coverEnabled() || dummy.isPassenger || !dummy.isAlive) return false
+        if (!dummy.coverEnabled() || dummy.isPassenger || !dummy.isAlive) {
+            dummy.thought.think("hide.canUse") { if (!dummy.coverEnabled()) "no: hiding is switched off" else "no: unable to hide" }
+            return false
+        }
         val now = dummy.tickCount
         if (now < dummy.hideRetryUntil || now < nextScanTick) return false
         nextScanTick = now + scanInterval()
-        return dummy.wantsCover()
+        val wants = dummy.wantsCover()
+        dummy.thought.think("hide.canUse") { if (wants) "yes: wants cover" else "no: no reason to hide" }
+        return wants
     }
 
-    override fun canContinueToUse(): Boolean =
-        !finished && dummy.coverEnabled() && !dummy.isPassenger && dummy.isAlive
+    override fun canContinueToUse(): Boolean {
+        val continues = !finished && dummy.coverEnabled() && !dummy.isPassenger && dummy.isAlive
+        if (!continues) {
+            dummy.thought.think("hide.canContinueToUse") {
+                "no: " + if (finished) "hiding finished" else if (!dummy.coverEnabled()) "hiding switched off" else "unable to hide"
+            }
+        }
+        return continues
+    }
 
     override fun start() {
+        dummy.thought.event("hide.start") { "running for cover" }
         val now = dummy.tickCount
         phase = Phase.SEEK
         finished = false
@@ -74,6 +90,7 @@ class DummyHideGoal(private val dummy: HumanoidDummyEntity) : Goal() {
     }
 
     override fun stop() {
+        dummy.thought.event("hide.stop") { "hide goal over (phase $phase)" }
         dummy.navigation.stop()
         dummy.isSprinting = false
         dummy.setCrouched(false)
@@ -110,6 +127,7 @@ class DummyHideGoal(private val dummy: HumanoidDummyEntity) : Goal() {
     // ================================================================================================== phases
 
     private fun enterSeek() {
+        dummy.thought.event("hide.phase") { "$phase -> SEEK (looking for cover)" }
         phase = Phase.SEEK
         cover = null
         candidates.clear()
@@ -119,6 +137,7 @@ class DummyHideGoal(private val dummy: HumanoidDummyEntity) : Goal() {
     }
 
     private fun enterReturn() {
+        dummy.thought.event("hide.phase") { "$phase -> RETURN (no reason to hide any more, walking home)" }
         phase = Phase.RETURN
         dummy.navigation.stop()
         dummy.isSprinting = false
@@ -131,16 +150,19 @@ class DummyHideGoal(private val dummy: HumanoidDummyEntity) : Goal() {
         val target = cover ?: nextCover()
         if (target == null) {
             // Nothing within reach is roofed: strafe instead of standing in the open, and try again later.
+            dummy.thought.event("hide.tickSeek") { "no cover within reach, falling back to strafing" }
             dummy.hideRetryUntil = dummy.tickCount + NO_COVER_RETRY_TICKS
             dummy.forcedStrafeUntil = dummy.tickCount + NO_COVER_RETRY_TICKS
             finished = true
             return
         }
+        if (cover == null) dummy.thought.event("hide.tickSeek") { "cover spot chosen at ${target.toShortString()}" }
         cover = target
 
         val dx = target.x + 0.5 - dummy.x
         val dz = target.z + 0.5 - dummy.z
         if (hypot(dx, dz) < ARRIVE_DISTANCE && abs(target.y - dummy.y) < ARRIVE_HEIGHT) {
+            dummy.thought.event("hide.phase") { "SEEK -> COVER (reached the cover spot)" }
             phase = Phase.COVER
             dummy.navigation.stop()
             dummy.isSprinting = false
@@ -148,19 +170,25 @@ class DummyHideGoal(private val dummy: HumanoidDummyEntity) : Goal() {
         }
 
         dummy.isSprinting = true
+        dummy.thought.think("hide.tickSeek") { "sprinting to cover" }
         if (!dummy.navigation.isInProgress) {
             if (!DummyAi.pathfinds.tryTake(dummy.level())) return // path budget used up this tick: wait one tick
             // moveTo returns false when there is no path; the next tick then picks the next candidate.
             if (!dummy.navigation.moveTo(target.x + 0.5, target.y.toDouble(), target.z + 0.5, 1.0)) {
+                dummy.thought.event("hide.tickSeek") { "no path to ${target.toShortString()}, trying the next spot" }
                 cover = null
             } else {
                 moveDeadline = dummy.tickCount + MOVE_TIMEOUT_TICKS
             }
         } else if (dummy.tickCount > moveDeadline) {
+            dummy.thought.event("hide.tickSeek") { "too slow to reach ${target.toShortString()}, giving up on it" }
             cover = null // too slow (stuck on something): give up on this spot
             dummy.navigation.stop()
         }
-        if (cover != null && dummy.navigation.isDone && hypot(dx, dz) >= ARRIVE_DISTANCE) cover = null // path ended short
+        if (cover != null && dummy.navigation.isDone && hypot(dx, dz) >= ARRIVE_DISTANCE) {
+            dummy.thought.event("hide.tickSeek") { "path ended short of ${target.toShortString()}, trying the next spot" }
+            cover = null // path ended short
+        }
     }
 
     private fun tickCover() {
@@ -169,14 +197,17 @@ class DummyHideGoal(private val dummy: HumanoidDummyEntity) : Goal() {
 
         // Pushed out of the spot (knockback): walk back into it.
         if (hypot(here.x + 0.5 - dummy.x, here.z + 0.5 - dummy.z) > DRIFT_DISTANCE) {
+            dummy.thought.event("hide.phase") { "COVER -> SEEK (pushed out of the cover spot)" }
             phase = Phase.SEEK
             return
         }
         // The roof is gone (blown up): look for new cover.
         if (dummy.tickCount % COVER_CHECK_INTERVAL == 0 && !isCovered(dummy.blockPosition())) {
+            dummy.thought.event("hide.tickCover") { "the roof is gone, looking for new cover" }
             enterSeek()
             return
         }
+        dummy.thought.think("hide.tickCover") { if (crouchTicks > 0) "in cover, crouching" else "in cover, standing" }
 
         if (crouchTicks > 0) {
             if (--crouchTicks == 0) dummy.setCrouched(false)
@@ -191,12 +222,19 @@ class DummyHideGoal(private val dummy: HumanoidDummyEntity) : Goal() {
         if (home == null || dummy.tickCount > returnDeadline ||
             hypot(home.x - dummy.x, home.z - dummy.z) < HOME_DISTANCE
         ) {
+            dummy.thought.event("hide.tickReturn") {
+                if (home == null) "no anchor to return to, done" else if (dummy.tickCount > returnDeadline) "walk home timed out, done" else "back home, done"
+            }
             finished = true
             return
         }
+        dummy.thought.think("hide.tickReturn") { "walking back to the anchor" }
         if (dummy.navigation.isDone) {
             if (!DummyAi.pathfinds.tryTake(dummy.level())) return
-            if (!dummy.navigation.moveTo(home.x, home.y, home.z, 1.0)) finished = true
+            if (!dummy.navigation.moveTo(home.x, home.y, home.z, 1.0)) {
+                dummy.thought.event("hide.tickReturn") { "no path home, done" }
+                finished = true
+            }
         }
     }
 
@@ -217,44 +255,70 @@ class DummyHideGoal(private val dummy: HumanoidDummyEntity) : Goal() {
     private fun search() {
         candidates.clear()
         val level = dummy.level()
-        val rng = dummy.getRandom()
         val origin = dummy.blockPosition()
         val cursor = BlockPos.MutableBlockPos()
-        val found = ArrayList<Pair<BlockPos, Double>>()
+        val found = ArrayList<BlockPos>(MAX_CANDIDATES)
 
-        repeat(SAMPLES) {
-            val x = origin.x + rng.nextInt(2 * SEARCH_RADIUS + 1) - SEARCH_RADIUS
-            val z = origin.z + rng.nextInt(2 * SEARCH_RADIUS + 1) - SEARCH_RADIUS
-            val chunk = level.chunkSource.getChunkNow(x shr 4, z shr 4) ?: return@repeat
-            val y = standingY(chunk, cursor, x, origin.y, z) ?: return@repeat
-            if (!roofed(chunk, x, y, z)) return@repeat
-            val dx = (x - origin.x).toDouble()
-            val dy = (y - origin.y).toDouble()
-            val dz = (z - origin.z).toDouble()
-            val score = hypot(hypot(dx, dy), dz) - thickness(chunk, cursor, x, y, z) * THICKNESS_BONUS
-            found.add(Pair(BlockPos(x, y, z), score))
+        var chunkX = Int.MIN_VALUE
+        var chunkZ = Int.MIN_VALUE
+        var chunk: LevelChunk? = null
+        var i = 0
+        while (i < OFFSETS.size && found.size < MAX_CANDIDATES) {
+            val x = origin.x + OFFSETS[i]
+            val z = origin.z + OFFSETS[i + 1]
+            i += 2
+            if (x shr 4 != chunkX || z shr 4 != chunkZ) {
+                chunkX = x shr 4
+                chunkZ = z shr 4
+                chunk = level.chunkSource.getChunkNow(chunkX, chunkZ)
+            }
+            val loaded = chunk ?: continue
+            val y = coveredY(loaded, cursor, x, origin.y, z) ?: continue
+            found.add(BlockPos(x, y, z))
         }
-        found.sortBy { it.second }
-        for (i in 0 until minOf(MAX_CANDIDATES, found.size)) candidates.addLast(found[i].first)
+        found.sortBy { origin.distSqr(it) }
+        candidates.addAll(found)
     }
 
-    /** True when [pos] is a spot the dummy could stand on that has a roof (read-only, never loads chunks). */
+    /** True when [pos] has a block above its head that hides it from above (read-only, never loads chunks). */
     private fun isCovered(pos: BlockPos): Boolean {
         val chunk = dummy.level().chunkSource.getChunkNow(pos.x shr 4, pos.z shr 4) ?: return false
-        return roofed(chunk, pos.x, pos.y, pos.z)
+        return hasRoof(chunk, BlockPos.MutableBlockPos(), pos.x, pos.y, pos.z, firstFreeY(chunk, pos.x, pos.z))
     }
 
-    /** The roof test: the top motion-blocking block of the column is at least two blocks above the dummy's head. */
-    private fun roofed(chunk: LevelChunk, x: Int, y: Int, z: Int): Boolean =
-        chunk.getHeight(Heightmap.Types.MOTION_BLOCKING, x and 15, z and 15) >= y + ROOF_MIN_OFFSET
+    /** The y of the first free block above the highest block of the column (the `WORLD_SURFACE` height). */
+    private fun firstFreeY(chunk: LevelChunk, x: Int, z: Int): Int =
+        chunk.getHeight(Heightmap.Types.WORLD_SURFACE, x and 15, z and 15) + 1
+
+    /**
+     * The y of the spot in column ([x], [z]) near [aroundY] that is standable and roofed, or null. The lowest roof block
+     * is at y + 2, so no spot above `surface - ROOF_CLEARANCE` can qualify: that bounds the scan, which makes open
+     * ground (the common case) almost free.
+     */
+    private fun coveredY(chunk: LevelChunk, cursor: BlockPos.MutableBlockPos, x: Int, aroundY: Int, z: Int): Int? {
+        val surface = firstFreeY(chunk, x, z)
+        val y = standingY(chunk, cursor, x, aroundY, z, surface - ROOF_CLEARANCE) ?: return null
+        return if (hasRoof(chunk, cursor, x, y, z, surface)) y else null
+    }
+
+    /** True when a block that [SkyExposure.blocksSight] lies in the column above the head of a dummy standing at [y]. */
+    private fun hasRoof(chunk: LevelChunk, cursor: BlockPos.MutableBlockPos, x: Int, y: Int, z: Int, surface: Int): Boolean {
+        for (above in y + ROOF_CLEARANCE - 1 until surface) {
+            cursor.set(x, above, z)
+            if (SkyExposure.blocksSight(chunk, cursor, chunk.getBlockState(cursor))) return true
+        }
+        return false
+    }
 
     /**
      * The y of the first spot in column ([x], [z]) near [aroundY] with a solid, dry floor and two free blocks above it,
-     * scanning down from [SEARCH_UP] blocks above [aroundY] to [SEARCH_DOWN] below. Null when there is none.
+     * scanning down from [SEARCH_UP] blocks above [aroundY] (or [maxY] if lower) to [SEARCH_DOWN] below. Null when there is none.
      */
-    private fun standingY(chunk: LevelChunk, cursor: BlockPos.MutableBlockPos, x: Int, aroundY: Int, z: Int): Int? {
+    private fun standingY(
+        chunk: LevelChunk, cursor: BlockPos.MutableBlockPos, x: Int, aroundY: Int, z: Int, maxY: Int
+    ): Int? {
         val level = dummy.level()
-        val top = minOf(aroundY + SEARCH_UP, level.maxBuildHeight - 3)
+        val top = minOf(aroundY + SEARCH_UP, maxY, level.maxBuildHeight - 3)
         val bottom = maxOf(aroundY - SEARCH_DOWN, level.minBuildHeight + 1)
         for (y in top downTo bottom) {
             val floor = chunk.getBlockState(cursor.set(x, y - 1, z))
@@ -268,30 +332,36 @@ class DummyHideGoal(private val dummy: HumanoidDummyEntity) : Goal() {
         return null
     }
 
-    /** Solid blocks in the [THICKNESS_SCAN] blocks above the dummy's head: how well the roof holds up against shells. */
-    private fun thickness(chunk: LevelChunk, cursor: BlockPos.MutableBlockPos, x: Int, y: Int, z: Int): Int {
-        var solid = 0
-        val top = minOf(y + 2 + THICKNESS_SCAN, dummy.level().maxBuildHeight - 1)
-        for (above in y + 2..top) {
-            if (!chunk.getBlockState(cursor.set(x, above, z)).getCollisionShape(chunk, cursor).isEmpty) solid++
-        }
-        return solid
-    }
-
     private companion object {
         /** A boss within range is looked for this often (ticks). */
         const val SCAN_INTERVAL = 20
 
-        const val SAMPLES = 200
         const val SEARCH_RADIUS = 24
         const val SEARCH_UP = 4
         const val SEARCH_DOWN = 6
-        const val MAX_CANDIDATES = 12
-        const val THICKNESS_SCAN = 8
-        const val THICKNESS_BONUS = 0.75
+        const val MAX_CANDIDATES = 8
 
-        /** The heightmap value is the y above the top blocking block, so a roof two blocks over the head gives y + 3. */
-        const val ROOF_MIN_OFFSET = 3
+        /** The lowest roof block is this far above the feet: the body is two blocks tall, so the block over the head is y + 2. */
+        const val ROOF_CLEARANCE = 3
+
+        /** (dx, dz) pairs of every column within [SEARCH_RADIUS], nearest first, flattened: dx0, dz0, dx1, dz1, ... */
+        val OFFSETS: IntArray = buildOffsets()
+
+        private fun buildOffsets(): IntArray {
+            val discs = ArrayList<IntArray>()
+            for (dx in -SEARCH_RADIUS..SEARCH_RADIUS) {
+                for (dz in -SEARCH_RADIUS..SEARCH_RADIUS) {
+                    if (dx * dx + dz * dz <= SEARCH_RADIUS * SEARCH_RADIUS) discs.add(intArrayOf(dx, dz))
+                }
+            }
+            discs.sortBy { it[0] * it[0] + it[1] * it[1] }
+            val flat = IntArray(discs.size * 2)
+            discs.forEachIndexed { index, pair ->
+                flat[index * 2] = pair[0]
+                flat[index * 2 + 1] = pair[1]
+            }
+            return flat
+        }
 
         const val ARRIVE_DISTANCE = 1.2
         const val ARRIVE_HEIGHT = 1.5

@@ -4,11 +4,12 @@ import com.teamuhi.superbenemies.SuperbEnemies
 import com.teamuhi.superbenemies.config.Ac130Config
 import com.teamuhi.superbenemies.entity.boss.ac130.Ac130BossEntity
 import com.teamuhi.superbenemies.entity.boss.ac130.Ac130Gun
-import com.teamuhi.superbenemies.entity.boss.common.BossRespawns
 import com.teamuhi.superbenemies.entity.boss.common.ResupplyNotices
-import com.teamuhi.superbenemies.entity.boss.common.ai.FlightController
-import com.teamuhi.superbenemies.entity.boss.common.ai.FlightMath
-import com.teamuhi.superbenemies.entity.boss.common.ai.TerrainGuard
+import com.teamuhi.superbenemies.entity.boss.common.air.AirResupply
+import com.teamuhi.superbenemies.entity.boss.common.air.FlightController
+import com.teamuhi.superbenemies.entity.boss.common.air.FlightMath
+import com.teamuhi.superbenemies.entity.boss.common.air.StuckWatch
+import com.teamuhi.superbenemies.entity.boss.common.air.TerrainGuard
 import com.teamuhi.superbenemies.entity.boss.common.ai.ThreatMonitor
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.server.level.ServerLevel
@@ -20,6 +21,7 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 /**
@@ -47,8 +49,37 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
     private val flight = FlightController(boss)
     private val guard = TerrainGuard(boss)
     private val threats = ThreatMonitor(boss)
+    private val stuck = StuckWatch(boss)
     private val targeting = Ac130Targeting(boss)
     private val gunnery = Ac130Gunnery(boss)
+
+    /** The idle roll and the flight to the depot (see [AirResupply]); this plane's options and helpers plug in here. */
+    private val resupply = AirResupply(boss, AirResupply.Settings(
+        limitedAmmo = { Ac130Config.LIMITED_AMMO.get() },
+        idleResupplySeconds = { Ac130Config.IDLE_RESUPPLY_SECONDS.get() },
+        idleResupplyChance = { Ac130Config.IDLE_RESUPPLY_CHANCE.get() },
+        resupplySeconds = { Ac130Config.RESUPPLY_SECONDS.get() },
+        globalAggro = { Ac130Config.GLOBAL_AGGRO.get() },
+        aggroRange = { Ac130Config.AGGRO_RANGE.get() },
+        bossBarRange = { Ac130Config.BOSS_BAR_RANGE.get() },
+        loseTargetFactor = Ac130Targeting.LOSE_TARGET_FACTOR,
+        clearanceHalfWidth = RESUPPLY_CLEARANCE_HALF_WIDTH,
+        maxClimb = RESUPPLY_MAX_CLIMB,
+        huntingMessage = MSG_HUNTING
+    ), object : AirResupply.Hooks {
+        override val homePos: Vec3 get() = boss.homePos
+        override val aim: Entity? get() = targeting.aim
+        override val stateTicks: Int get() = this@Ac130BossBrain.stateTicks
+
+        override fun fallbackAnchor(): Vec3? = targeting.lastKnown.anchor ?: idleCentre
+        override fun anySpent(): Boolean = gunnery.anySpent()
+        override fun fly(dir: Vec3, throttle: Float) = this@Ac130BossBrain.fly(dir, throttle)
+        override fun cruiseAltitude(): Double = this@Ac130BossBrain.cruiseAltitude()
+        override fun awayFrom(entity: Entity): Vec3 = this@Ac130BossBrain.awayFrom(entity)
+        override fun currentHeading(): Vec3 = this@Ac130BossBrain.currentHeading()
+        override fun towards(point: Vec3): Vec3 = this@Ac130BossBrain.towards(point)
+        override fun enterResupply() = this@Ac130BossBrain.enter(Ac130State.RESUPPLY, why = "idle with spent guns")
+    })
 
     var state: Ac130State = Ac130State.INGRESS
         private set
@@ -85,11 +116,12 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
     private var evadeSide = 1.0
     private var evadeDuration = 35
 
-    // --- resupply ---
-    private var depot: Vec3? = null
+    // --- idle ---
+    // With no target the boss loiters over `targeting.lastKnown.anchor` (where it last had one), not over its home point,
+    // which may be far from where the fight moved to.
 
-    /** Where the fight was when the boss left to rearm; its replacement appears around here. */
-    private var resupplyFrom: Vec3? = null
+    /** Where the fight was when this boss replaced one that left to rearm; used until it has had a target of its own. */
+    private var idleCentre: Vec3? = null
 
     // --- taunt ---
     private var tauntPhase = TauntPhase.SETUP
@@ -104,33 +136,43 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
     fun tick() {
         val level = boss.level() as? ServerLevel ?: return
 
+        boss.thought.heartbeat { snapshot() }
+
         if (boss.crippled) {
             if (state != Ac130State.CRIPPLED) enterCrippled()
             flight.release()
             return
         }
 
+        if (Ac130Config.UNSTUCK_TELEPORT.get()) {
+            unstuck(level)
+        } else {
+            stuck.reset()
+        }
+
         stateTicks++
         targeting.update(level, radiusNow())
         val target = targeting.aim
+        target?.let { targeting.lastKnown.anchorAt(it.position()) }
+        resupply.countIdle(state == Ac130State.INGRESS && target == null)
 
         if (threats.tick()) enterEvade()
 
-        // The target is gone: stop attacking and loiter over home (INGRESS without a target).
-        if (target == null && state.needsTarget()) enter(Ac130State.INGRESS)
+        // The target is gone: stop attacking and loiter where it was (INGRESS without a target).
+        if (target == null && state.needsTarget()) enter(Ac130State.INGRESS, why = "target lost")
 
         // Finite ammunition: with every enabled gun empty, go and rearm.
         if ((state == Ac130State.INGRESS || state == Ac130State.ORBIT) && Ac130Config.LIMITED_AMMO.get() &&
             gunnery.anyEnabled() && !gunnery.hasUsableGun()
         ) {
-            enter(Ac130State.RESUPPLY)
+            enter(Ac130State.RESUPPLY, why = "every enabled gun is out of ammo")
         }
 
         when (state) {
             Ac130State.INGRESS -> tickIngress(target)
             Ac130State.ORBIT -> if (target != null) tickOrbit(target)
             Ac130State.TAUNT -> if (target != null) tickTaunt(target)
-            Ac130State.RESUPPLY -> tickResupply()
+            Ac130State.RESUPPLY -> resupply.tick()
             Ac130State.EVADE -> tickEvade()
             Ac130State.CRIPPLED -> {}
         }
@@ -145,6 +187,16 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
         threats.applyFlareInput()
 
         safetyNet(target)
+    }
+
+    /** The heartbeat line: state, target, range, cover, health, ammunition, fire mode and position. */
+    private fun snapshot(): String {
+        val victim = targeting.target
+        val range = victim?.let { FlightMath.horizontalDistance(it.position(), boss.position()).roundToInt().toString() } ?: "-"
+        return "state=$state ticks=$stateTicks target=${victim?.name?.string ?: "none"} dist=$range " +
+                "hidden=${if (targeting.lastKnown.hidden) "y" else "n"} hp=${(boss.healthFraction() * 100).roundToInt()}% " +
+                "ammo=[${gunnery.ammoSummary()}] fire=$fireMode radius=${radiusNow().roundToInt()} " +
+                "pos=${boss.x.roundToInt()},${boss.y.roundToInt()},${boss.z.roundToInt()}"
     }
 
     /**
@@ -176,13 +228,22 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
         // A reloaded evade restarts from the beginning; the other states resume (and re-derive their working data).
         if (state == Ac130State.EVADE) state = Ac130State.INGRESS
         stateTicks = 0
+        boss.thought.event("load") { "restored state $state" }
     }
 
     // ================================================================================================== helpers
 
     private fun randomBetween(min: Int, max: Int): Int = min + boss.getRandom().nextInt(max - min + 1)
 
-    private fun referenceY(aim: Entity? = targeting.aim): Double = aim?.y ?: boss.homePos.y
+    private fun referenceY(aim: Entity? = targeting.aim): Double = aim?.y ?: idleSpot().y
+
+    /** The spot circled with no target: the last target, else the fight a replacement came back to, else home. */
+    private fun idleSpot(): Vec3 = targeting.lastKnown.anchor ?: idleCentre ?: boss.homePos
+
+    /** Called for a replacement boss: the fight was around [anchor], so circle there until a target turns up. */
+    fun rememberFight(anchor: Vec3) {
+        idleCentre = anchor
+    }
 
     private fun cruiseAltitude(): Double =
         min(referenceY() + Ac130Config.CRUISE_HEIGHT.get().toDouble(), boss.level().maxBuildHeight + 60.0)
@@ -244,7 +305,10 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
     private fun releaseFlare() {
         if (boss.isWreck || boss.crippled) return
         if (boss.decoyCount < 1) {
-            if (Ac130Config.LIMITED_AMMO.get()) return
+            if (Ac130Config.LIMITED_AMMO.get()) {
+                boss.thought.think("releaseFlare") { "flares empty, none released" }
+                return
+            }
             boss.decoyCount = boss.computed().decoyMagazineSize
         }
         boss.decoyInputDown = true
@@ -252,9 +316,23 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
 
     // ================================================================================================== transitions
 
+    /**
+     * Called every tick. The gunship stayed on one spot for `unstuckSeconds`: it is put in open air (see [StuckWatch])
+     * and starts over from INGRESS, unless it was on its way to rearm, which carries on. Nothing is free: tried again
+     * after another window.
+     */
+    private fun unstuck(level: ServerLevel) {
+        val spot = stuck.rescueSpot(level, Ac130Config.UNSTUCK_SECONDS.get()) ?: return
+        boss.thought.event("unstuck") { "stuck at ${boss.position()}, moved to $spot" }
+        boss.relaunch(spot)
+        flight.release()
+        if (!withdrawn) enter(Ac130State.INGRESS, why = "stuck, relaunched")
+    }
+
     /** @param resume true when returning from an evade: keeps the per-state progress */
-    private fun enter(next: Ac130State, resume: Boolean = false) {
+    private fun enter(next: Ac130State, resume: Boolean = false, why: String = "") {
         if (next == state && !resume) return
+        boss.thought.event("state") { "$state -> $next" + if (why.isNotEmpty()) " ($why)" else "" }
         state = next
         stateTicks = 0
         // Only the orbit (and the idle/climbing loiters inside INGRESS and RESUPPLY) use SBW's autopilot; each
@@ -272,7 +350,7 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
             }
 
             Ac130State.RESUPPLY -> {
-                depot = null
+                resupply.reset()
                 boss.announce(MSG_WITHDRAW, ResupplyNotices.WITHDRAW_STYLE)
             }
 
@@ -291,16 +369,21 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
         if (state == Ac130State.CRIPPLED) return
         if (state == Ac130State.EVADE) {
             evadeDuration = max(evadeDuration, stateTicks + 25) // a second missile extends the break
+            boss.thought.event("enterEvade") { "another missile: evade extended to $evadeDuration ticks" }
             return
         }
         resumeState = state
         resumeTicks = stateTicks
         evadeSide = if (boss.getRandom().nextBoolean()) 1.0 else -1.0
         evadeDuration = randomBetween(EVADE_MIN, EVADE_MAX)
-        enter(Ac130State.EVADE)
+        boss.thought.event("enterEvade") {
+            "evading from $resumeState to the ${if (evadeSide > 0) "right" else "left"} for $evadeDuration ticks"
+        }
+        enter(Ac130State.EVADE, why = "missile inbound")
     }
 
     private fun enterCrippled() {
+        boss.thought.event("enterCrippled") { "$state -> CRIPPLED (health gone, crashing)" }
         state = Ac130State.CRIPPLED
         stateTicks = 0
         boss.loiterActive = false
@@ -311,13 +394,18 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
 
     /**
      * Fly to the target at cruise altitude. Inside [INGRESS_CIRCLE_FACTOR] x radius, if the plane is still too low, it
-     * circles the target while it climbs instead of overflying it. With no target it loiters over home.
+     * circles the target while it climbs instead of overflying it. With no target it loiters over the last target (or
+     * the fight its replacement came back to, or home).
      */
     private fun tickIngress(target: Entity?) {
         val cruise = cruiseAltitude()
 
         if (target == null) {
-            flyPylon(boss.homePos, cruise, baseRadius())
+            boss.thought.think("tickIngress") {
+                "no target, circling ${if (targeting.lastKnown.anchor != null) "where the last target was seen" else if (idleCentre != null) "the fight it came back to" else "home"}"
+            }
+            flyPylon(idleSpot(), cruise, baseRadius())
+            resupply.rollIdle()
             return
         }
 
@@ -328,13 +416,15 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
 
         if (distance < r * INGRESS_CIRCLE_FACTOR) {
             if (altitudeReady || stateTicks > INGRESS_TIMEOUT) {
-                enter(Ac130State.ORBIT)
+                enter(Ac130State.ORBIT, why = if (altitudeReady) "at the circle and altitude" else "climb timed out, orbiting low")
                 return
             }
+            boss.thought.think("tickIngress") { "circling ${target.name.string} while climbing to altitude" }
             flyPylon(target.position(), cruise, r)
             return
         }
 
+        boss.thought.think("tickIngress") { "flying in on ${target.name.string}" }
         val heading = if (distance < 40.0) currentHeading() else towards(target.position())
         fly(FlightMath.tilted(heading, (altitudeError * 0.1).coerceIn(-4.0, 18.0)), INGRESS_THROTTLE)
     }
@@ -347,14 +437,15 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
 
         // Too far from the target to ever bring the guns to bear (it ran, or teleported): fly in again.
         if (FlightMath.horizontalDistance(boss.position(), target.position()) > r * ORBIT_LOSE_FACTOR) {
-            enter(Ac130State.INGRESS)
+            enter(Ac130State.INGRESS, why = "target too far from the orbit, flying in again")
             return
         }
         // The autopilot sheds altitude in tight banked turns: climb back instead of orbiting low.
         if (boss.y < cruise - ALTITUDE_RECOVERY && stateTicks > 60) {
-            enter(Ac130State.INGRESS)
+            enter(Ac130State.INGRESS, why = "orbit sank, climbing back")
             return
         }
+        boss.thought.think("tickOrbit") { "orbiting ${target.name.string}, fire mode $fireMode" }
 
         manageFireMode(target)
         val centre = followTarget(orbitFocus(target), r)
@@ -374,7 +465,7 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
             if (fireMode == Ac130FireMode.NORMAL && Ac130Config.TAUNT_ENABLED.get() && gunnery.anyEnabled() &&
                 boss.getRandom().nextInt(TAUNT_WEIGHT + ORBIT_CONTINUE_WEIGHT) < TAUNT_WEIGHT
             ) {
-                enter(Ac130State.TAUNT)
+                enter(Ac130State.TAUNT, why = "taunt roll won")
             }
         }
     }
@@ -411,11 +502,10 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
         val before = radiusNow()
         radius = Mth.lerp(RADIUS_GAIN, before, goal)
 
-        if (Ac130Config.DEBUG_LOGGING.get() && abs(radius - before) > 1.0 && boss.tickCount % 40 < RADIUS_ADAPT_INTERVAL) {
-            SuperbEnemies.LOGGER.info(
-                "[AC-130 boss] orbit radius {} -> {} (suggested {}, configured {})",
-                "%.1f".format(before), "%.1f".format(radius), "%.1f".format(wanted), "%.1f".format(base)
-            )
+        if (boss.thought.enabled && abs(radius - before) > 1.0 && boss.tickCount % 40 < RADIUS_ADAPT_INTERVAL) {
+            boss.thought.event("adaptRadius") {
+                "orbit radius ${"%.1f".format(before)} -> ${"%.1f".format(radius)} (suggested ${"%.1f".format(wanted)}, configured ${"%.1f".format(base)})"
+            }
         }
     }
 
@@ -431,6 +521,9 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
         val now = boss.tickCount
         if (fireMode != Ac130FireMode.NORMAL) {
             if (now >= modeEndTick || gunnery.readyGuns().size < 2) {
+                boss.thought.event("manageFireMode") {
+                    "$fireMode fire over: ${if (now >= modeEndTick) "time is up" else "fewer than two usable guns"}"
+                }
                 endFireMode()
             } else if (fireMode == Ac130FireMode.SPLIT && now >= nextSplitRefreshTick) {
                 (boss.level() as? ServerLevel)?.let { refreshSplit(it, target) }
@@ -439,11 +532,22 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
         }
         if (stateTicks < nextModeRollTick) return
         nextModeRollTick = stateTicks + randomBetween(MODE_ROLL_MIN, MODE_ROLL_MAX)
-        if (gunnery.readyGuns().size < 2) return
+        if (gunnery.readyGuns().size < 2) {
+            boss.thought.think("manageFireMode") { "normal fire only: fewer than two usable guns" }
+            return
+        }
 
         val split = Ac130Config.SPLIT_FIRE_CHANCE.get()
         val focus = Ac130Config.FOCUS_FIRE_CHANCE.get()
         val roll = boss.getRandom().nextInt(100)
+        boss.thought.event("manageFireMode") {
+            "fire mode roll $roll (split below $split, focus below ${split + focus}) -> " +
+                    when {
+                        roll < split -> "SPLIT"
+                        roll < split + focus -> "FOCUS"
+                        else -> "NORMAL"
+                    }
+        }
         when {
             roll < split -> startSplit(target)
             roll < split + focus -> startFocus(target)
@@ -454,12 +558,14 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
         fireMode = Ac130FireMode.FOCUS
         modeEndTick = boss.tickCount + randomBetween(FOCUS_MIN, FOCUS_MAX)
         focusPoint = target.boundingBox.center
+        boss.thought.event("startFocus") { "focus fire: every gun on ${target.name.string}'s spot for ${modeEndTick - boss.tickCount} ticks" }
     }
 
     private fun startSplit(target: Entity) {
         fireMode = Ac130FireMode.SPLIT
         modeEndTick = boss.tickCount + randomBetween(SPLIT_MIN, SPLIT_MAX)
         splitSpotAngle = boss.getRandom().nextDouble() * Math.PI * 2.0
+        boss.thought.event("startSplit") { "split fire: one gun per victim for ${modeEndTick - boss.tickCount} ticks" }
         (boss.level() as? ServerLevel)?.let { refreshSplit(it, target) }
     }
 
@@ -483,6 +589,10 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
             }
         }
         splitPlan = Ac130FirePlan(orders)
+        boss.thought.think("refreshSplit") {
+            "split fire on ${victims.joinToString { it.name.string }}" +
+                    if (victims.size < guns.size) ", spare guns on spots around ${primary.name.string}" else ""
+        }
         splitCentre = Vec3(victims.sumOf { it.x } / victims.size, primary.y, victims.sumOf { it.z } / victims.size)
     }
 
@@ -530,9 +640,10 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
         val altitudeError = ground + TAUNT_PASS_HEIGHT - boss.y
         val tilt = (altitudeError * 0.1).coerceIn(-6.0, 10.0)
         val distance = FlightMath.horizontalDistance(boss.position(), target.position())
+        boss.thought.think("tickTaunt") { "taunt flyby over ${target.name.string}: ${tauntPhase.name.lowercase()}" }
 
         if (stateTicks > TAUNT_TIMEOUT) {
-            enter(Ac130State.INGRESS)
+            enter(Ac130State.INGRESS, why = "taunt timed out")
             return
         }
 
@@ -558,57 +669,16 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
                 if (distance < TAUNT_FLARE_RANGE && flaresDropped < TAUNT_MAX_FLARES && now >= nextTauntFlareTick &&
                     !boss.recentlyDamaged(TAUNT_NO_FLARE_TICKS)
                 ) {
+                    if (flaresDropped == 0) boss.thought.event("tickTaunt") { "dropping angel flares" }
                     releaseFlare()
                     flaresDropped++
                     // Two bursts back to back, then a gap: a pair every TAUNT_PAIR_INTERVAL ticks.
                     nextTauntFlareTick = now + if (flaresDropped % 2 == 1) 1 else TAUNT_PAIR_INTERVAL - 1
                 }
 
-                if (tauntPassed) enter(Ac130State.INGRESS)
+                if (tauntPassed) enter(Ac130State.INGRESS, why = "flyby done")
             }
         }
-    }
-
-    // ================================================================================================== resupply
-
-    /**
-     * Out of ammunition: climb and fly to a point [RESUPPLY_DISTANCE] blocks beyond the target (away from where the
-     * fight was). Once it has arrived, or no player can see it any more, the boss is removed and a replacement with the
-     * same health and a full load appears around the fight after `resupplySeconds` (see [BossRespawns]), which saves
-     * keeping a far-away gunship loaded and ticking.
-     */
-    private fun tickResupply() {
-        val aim = targeting.aim
-        val dest = depot ?: run {
-            val base = aim?.position() ?: boss.position()
-            resupplyFrom = base
-            val away = aim?.let { awayFrom(it) } ?: currentHeading()
-            base.add(away.scale(resupplyDistance()))
-        }.also { depot = it }
-        val altitude = cruiseAltitude() + RESUPPLY_EXTRA_HEIGHT
-
-        val altitudeError = altitude - boss.y
-        fly(FlightMath.tilted(towards(dest), (altitudeError * 0.1).coerceIn(-4.0, 16.0)), 2.6f)
-        val arrived = FlightMath.horizontalDistance(boss.position(), dest) < RESUPPLY_ARRIVE_DISTANCE
-        val unseen = stateTicks > RESUPPLY_MIN_VISIBLE_TICKS &&
-                !BossRespawns.playerWithin(boss, Ac130Config.BOSS_BAR_RANGE.get() + RESUPPLY_UNSEEN_MARGIN)
-        if (arrived || unseen || stateTicks > RESUPPLY_TRAVEL_TIMEOUT) {
-            BossRespawns.withdraw(
-                boss, MSG_HUNTING, aim?.position() ?: resupplyFrom ?: boss.homePos, boss.homePos,
-                Ac130Config.RESUPPLY_SECONDS.get().toInt() * 20L, RESUPPLY_CLEARANCE_HALF_WIDTH
-            )
-        }
-    }
-
-    /**
-     * How far beyond the target the depot lies. Without `globalAggro` a target farther than aggroRange x
-     * [Ac130Targeting.LOSE_TARGET_FACTOR] is dropped, so the depot stays inside that (the boss then comes back to the
-     * same player).
-     */
-    private fun resupplyDistance(): Double {
-        if (Ac130Config.GLOBAL_AGGRO.get()) return RESUPPLY_DISTANCE
-        val keep = Ac130Config.AGGRO_RANGE.get() * Ac130Targeting.LOSE_TARGET_FACTOR * RESUPPLY_KEEP_TARGET_FRACTION
-        return min(RESUPPLY_DISTANCE, keep)
     }
 
     // ================================================================================================== evade
@@ -619,11 +689,12 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
         val sideways = Vec3(-bearing.z * evadeSide, 0.0, bearing.x * evadeSide)
         val spare = boss.y - guard.floorAhead(referenceY() + UNKNOWN_TERRAIN_OFFSET)
         val pitch = if (spare > 120.0) -6.0 else 3.0
+        boss.thought.think("tickEvade") { "breaking away from a missile, will resume $resumeState" }
         fly(FlightMath.tilted(sideways, pitch), 3.0f, maxBank = EVADE_MAX_BANK)
 
         if (stateTicks >= evadeDuration) {
             val ticks = resumeTicks
-            enter(resumeState, resume = true)
+            enter(resumeState, resume = true, why = "evade over")
             stateTicks = ticks
         }
     }
@@ -644,6 +715,9 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
         val clearance = boss.y - floor
         val buffer = GUARD_BASE_BUFFER + descent
 
+        boss.thought.think("safetyNet") {
+            if (clearance < buffer) "terrain safety net pulling up" else "terrain safety net idle"
+        }
         if (clearance < buffer) {
             val urgency = (1.0 - clearance / buffer).coerceIn(0.0, 1.0)
             val detour = target?.let {
@@ -731,18 +805,9 @@ class Ac130BossBrain(private val boss: Ac130BossEntity) {
         const val EVADE_MIN = 20
         const val EVADE_MAX = 28
 
-        // Resupply
-        const val RESUPPLY_DISTANCE = 600.0
-        /** Without globalAggro the depot is at most this fraction of the lose-target distance from the target. */
-        const val RESUPPLY_KEEP_TARGET_FRACTION = 0.75
-        const val RESUPPLY_EXTRA_HEIGHT = 60.0
-        const val RESUPPLY_ARRIVE_DISTANCE = 100.0
-        const val RESUPPLY_TRAVEL_TIMEOUT = 2400
-
-        /** The boss only vanishes this long after leaving, and once no player is within the bar range plus the margin. */
-        const val RESUPPLY_MIN_VISIBLE_TICKS = 100
-        const val RESUPPLY_UNSEEN_MARGIN = 64.0
+        // Resupply (the shared values are in AirResupply)
         const val RESUPPLY_CLEARANCE_HALF_WIDTH = 16.0
+        const val RESUPPLY_MAX_CLIMB = 16.0
 
         // Terrain guard
         /** Unloaded chunks are beyond the active fight area; do not treat them as phantom skyscrapers. */

@@ -1,6 +1,10 @@
 package com.teamuhi.superbenemies.entity.boss.common
 
 import com.atsuishio.superbwarfare.entity.vehicle.base.VehicleEntity
+import com.teamuhi.superbenemies.entity.boss.common.air.BossAircraft
+import com.teamuhi.superbenemies.entity.boss.common.ground.GroundProfile
+import com.teamuhi.superbenemies.entity.boss.common.ground.GroundTerrain
+import com.teamuhi.superbenemies.entity.boss.common.ground.SpawnVerdict
 import net.minecraft.core.BlockPos
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.nbt.ListTag
@@ -36,7 +40,9 @@ class PendingBoss(
     val dueTick: Long,
     /** Lang key of the "begins hunting" notice shown when it is back. */
     val huntingKey: String,
-    val clearanceHalfWidth: Double
+    val clearanceHalfWidth: Double,
+    /** True for a boss that drives on the ground: the replacement is put on the surface, not launched into the air. */
+    val ground: Boolean = false
 ) {
     fun save(): CompoundTag = CompoundTag().apply {
         putString(TAG_TYPE, typeId.toString())
@@ -50,6 +56,7 @@ class PendingBoss(
         putLong(TAG_DUE, dueTick)
         putString(TAG_HUNTING, huntingKey)
         putDouble(TAG_CLEARANCE, clearanceHalfWidth)
+        putBoolean(TAG_GROUND, ground)
     }
 
     companion object {
@@ -64,6 +71,7 @@ class PendingBoss(
         private const val TAG_DUE = "Due"
         private const val TAG_HUNTING = "Hunting"
         private const val TAG_CLEARANCE = "Clearance"
+        private const val TAG_GROUND = "Ground"
 
         fun load(tag: CompoundTag): PendingBoss? {
             val typeId = ResourceLocation.tryParse(tag.getString(TAG_TYPE)) ?: return null
@@ -74,7 +82,9 @@ class PendingBoss(
                 Vec3(tag.getDouble(TAG_HOME_X), tag.getDouble(TAG_HOME_Y), tag.getDouble(TAG_HOME_Z)),
                 tag.getLong(TAG_DUE),
                 tag.getString(TAG_HUNTING),
-                tag.getDouble(TAG_CLEARANCE)
+                tag.getDouble(TAG_CLEARANCE),
+                // Saves from before the ground bosses have no such key: those entries are aircraft.
+                tag.contains(TAG_GROUND) && tag.getBoolean(TAG_GROUND)
             )
         }
     }
@@ -107,7 +117,8 @@ class BossRespawnData : SavedData() {
 /**
  * A boss that runs out of ammunition does not loiter somewhere far away eating chunk loading and entity ticks: once it
  * is out of sight it is removed ([withdraw]) and a replacement with the same health and a full load appears around the
- * fight after `resupplySeconds` ([tick]).
+ * fight after `resupplySeconds` ([tick]). A plane comes back in the air; a ground boss ([BossVehicle.groundBoss]) on the
+ * surface, on a spot its [GroundProfile] can stand on.
  *
  * The replacement waits (the entry stays saved) while nobody is online, the difficulty is peaceful, or no free spot
  * with loaded chunks is found yet.
@@ -145,15 +156,20 @@ object BossRespawns {
         home: Vec3,
         delayTicks: Long,
         clearanceHalfWidth: Double
-    ) where T : VehicleEntity, T : BossAircraft {
+    ) where T : VehicleEntity, T : BossVehicle {
         val level = boss.level() as? ServerLevel ?: return
         val typeId = ForgeRegistries.ENTITY_TYPES.getKey(boss.type) ?: return
         val fraction = boss.healthFraction().coerceIn(MIN_HEALTH_FRACTION, 1f)
         val data = data(level)
         data.pending.add(
-            PendingBoss(typeId, fraction, anchor, home, level.gameTime + delayTicks, huntingKey, clearanceHalfWidth)
+            PendingBoss(
+                typeId, fraction, anchor, home, level.gameTime + delayTicks, huntingKey, clearanceHalfWidth, boss.groundBoss
+            )
         )
         data.setDirty()
+        boss.thought.event("respawns.withdraw") {
+            "withdrawn to rearm at ${(fraction * 100).toInt()}% health: replacement due in ${delayTicks / 20}s around ${anchor.x.toInt()}, ${anchor.z.toInt()}"
+        }
         boss.discard()
     }
 
@@ -181,22 +197,28 @@ object BossRespawns {
         if (!ForgeRegistries.ENTITY_TYPES.containsKey(pending.typeId)) return true
         val type = ForgeRegistries.ENTITY_TYPES.getValue(pending.typeId) ?: return true
         val boss = type.create(level) ?: return true
-        if (boss !is BossAircraft) {
+        // The entry and the entity must agree on the kind: a type that changed under an old save is dropped.
+        if (boss !is BossVehicle || boss.groundBoss != pending.ground || (!pending.ground && boss !is BossAircraft)) {
             boss.discard()
             return true
         }
 
         val nearest = players.minBy { it.distanceToSqr(pending.anchor) }
-        val spot = findSpot(level, type.height.toDouble(), pending, nearest) ?: run {
+        val spot = (if (pending.ground) findGroundSpot(level, type.height.toDouble(), type.width.toDouble(), boss.groundProfile(), pending, nearest)
+        else findSpot(level, type.height.toDouble(), pending, nearest)) ?: run {
             boss.discard()
             return false
         }
         val yaw = (Mth.RAD_TO_DEG * atan2(-(pending.anchor.x - spot.x), pending.anchor.z - spot.z)).toFloat()
         boss.moveTo(spot.x, spot.y, spot.z, yaw, 0f)
         boss.restoreHealthFraction(pending.healthFraction)
-        boss.prepareLaunch(pending.home)
+        if (boss is BossAircraft) boss.prepareLaunch(pending.home) else boss.prepareGround(pending.home)
+        boss.rememberFight(pending.anchor)
         if (!level.addFreshEntity(boss)) return false
 
+        boss.thought.event("respawns.respawn") {
+            "replacement spawned at ${spot.x.toInt()}, ${spot.y.toInt()}, ${spot.z.toInt()} with ${(pending.healthFraction * 100).toInt()}% health, hunting around ${pending.anchor.x.toInt()}, ${pending.anchor.z.toInt()}"
+        }
         boss.announce(pending.huntingKey, ResupplyNotices.HUNTING_STYLE, pending.anchor)
         return true
     }
@@ -227,6 +249,36 @@ object BossRespawns {
         return null
     }
 
+    /**
+     * The ground counterpart of [findSpot]: a spot on a ring around the fight (or the nearest player), in loaded chunks and
+     * inside the world border, on dry (or, for a floating boss, watery) ground the [profile] can drive on, with room for
+     * the hull ([GroundTerrain.checkSpawn]). The height is the surface there; there is no altitude.
+     */
+    private fun findGroundSpot(
+        level: ServerLevel, height: Double, width: Double, profile: GroundProfile, pending: PendingBoss, nearestPlayer: Vec3
+    ): Vec3? {
+        if (level.dimensionType().hasCeiling()) return null
+        val half = max(pending.clearanceHalfWidth, width / 2.0)
+        for (center in listOf(pending.anchor, nearestPlayer)) {
+            repeat(ATTEMPTS * 2) {
+                val angle = level.random.nextDouble() * Math.PI * 2.0
+                val radius = GROUND_RING_MIN + level.random.nextDouble() * (GROUND_RING_MAX - GROUND_RING_MIN)
+                val x = center.x + cos(angle) * radius
+                val z = center.z + sin(angle) * radius
+                if (!level.worldBorder.isWithinBounds(x, z, GROUND_BORDER_MARGIN)) return@repeat
+
+                val bx = Mth.floor(x)
+                val bz = Mth.floor(z)
+                val cell = GroundTerrain.sample(level, GroundTerrain.cellOf(x, profile), GroundTerrain.cellOf(z, profile), profile)
+                if (!GroundTerrain.passable(cell, profile) || cell.foliage) return@repeat
+                val surfaceY = (GroundTerrain.spawnY(level, bx, bz, profile) ?: return@repeat) + GROUND_LIFT
+                val verdict = GroundTerrain.checkSpawn(level, x, surfaceY, z, half, height + GROUND_HEADROOM, profile)
+                if (verdict == SpawnVerdict.OK) return Vec3(x, surfaceY, z)
+            }
+        }
+        return null
+    }
+
     private const val CHECK_INTERVAL = 20L
     private const val MIN_HEALTH_FRACTION = 0.11f
     private const val ATTEMPTS = 8
@@ -236,4 +288,9 @@ object BossRespawns {
     private const val HEADROOM = 40.0
     private const val MIN_CLEARANCE_HEIGHT = 7.0
     private const val BORDER_MARGIN = 64.0
+    private const val GROUND_RING_MIN = 80.0
+    private const val GROUND_RING_MAX = 140.0
+    private const val GROUND_BORDER_MARGIN = 16.0
+    private const val GROUND_LIFT = 0.1
+    private const val GROUND_HEADROOM = 0.5
 }

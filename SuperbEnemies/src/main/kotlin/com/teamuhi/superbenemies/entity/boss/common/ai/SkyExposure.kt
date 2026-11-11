@@ -23,6 +23,9 @@ import net.minecraft.world.phys.Vec3
  * (`data/superbenemies/tags/blocks/boss_see_through.json`: glass, leaves, fences, carpets, iron bars, chains,
  * scaffolding) can be extended or overridden by a datapack, for blocks from other mods too.
  *
+ * Smoke ([SmokeScreen]) also hides: an entity standing in a smoke cloud is not exposed, and a sight line through one fails
+ * [hasLineOfSight]. Only the `DYNAMIC` method asks these questions (see [LastKnownLocation]), so `STATIC` bosses ignore smoke.
+ *
  * Chunks are read with `getChunkNow`, so this never loads or generates terrain; an unloaded column counts as not exposed.
  */
 object SkyExposure {
@@ -30,12 +33,16 @@ object SkyExposure {
     val SEE_THROUGH: TagKey<Block> =
         TagKey.create(Registries.BLOCK, ResourceLocation(SuperbEnemies.MOD_ID, "boss_see_through"))
 
+    /** True when [entity] can be seen from above: it is under [isUnderOpenSky] and not standing in a smoke cloud. */
+    fun isExposed(entity: Entity): Boolean = !SmokeScreen.inSmoke(entity) && isUnderOpenSky(entity)
+
     /**
-     * True when nothing covers [entity] from above. Fast path: the `WORLD_SURFACE` heightmap (every non-air block) says
-     * where the highest block of the column is; at or above it nothing can cover the entity. Otherwise only the blocks
-     * between its head and that height are scanned, and the first one that blocks sight ends the scan.
+     * True when nothing covers [entity] from above (blocks only; smoke does not count). Fast path: the `WORLD_SURFACE`
+     * heightmap (every non-air block) says where the highest block of the column is; at or above it nothing can cover
+     * the entity. Otherwise only the blocks between its head and that height are scanned, and the first one that blocks
+     * sight ends the scan.
      */
-    fun isExposed(entity: Entity): Boolean {
+    fun isUnderOpenSky(entity: Entity): Boolean {
         val box = entity.boundingBox
         val x = Mth.floor((box.minX + box.maxX) * 0.5)
         val z = Mth.floor((box.minZ + box.maxZ) * 0.5)
@@ -57,12 +64,14 @@ object SkyExposure {
         !state.isAir && !state.`is`(SEE_THROUGH) && !state.getCollisionShape(level, pos).isEmpty
 
     /**
-     * True when at least two of three rays from [source] reach [target] without crossing a solid block. Checking more
+     * True when at least two of three rays from [source] reach [target] without crossing a solid block or a smoke cloud
+     * ([SmokeScreen.blocksLine]). Checking more
      * than the hitbox centre avoids treating one narrow doorway or window aligned with the centre as full visibility
      * into a deep structure, while still allowing a target to be seen through a genuinely open side.
      */
     fun hasLineOfSight(source: Entity, target: Entity): Boolean {
         if (source.level() !== target.level()) return false
+        if (SmokeScreen.blocksLine(source.level(), source.getEyePosition(1f), target.boundingBox.center)) return false
         val box = target.boundingBox
         val targetHeight = box.maxY - box.minY
         val heights = doubleArrayOf(

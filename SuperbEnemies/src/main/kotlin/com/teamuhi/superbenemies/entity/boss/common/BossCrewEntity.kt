@@ -27,7 +27,7 @@ class BossCrewEntity(type: EntityType<BossCrewEntity>, level: Level) : Mob(type,
         super.tick()
         if (!level().isClientSide && tickCount > ORPHAN_GRACE_TICKS) {
             val mount = vehicle
-            if (mount !is BossAircraft || mount.isRemoved) discard()
+            if (mount !is BossVehicle || mount.isRemoved) discard()
         }
     }
 

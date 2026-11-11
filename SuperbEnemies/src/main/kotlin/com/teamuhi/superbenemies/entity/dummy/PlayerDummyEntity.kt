@@ -1,6 +1,7 @@
 package com.teamuhi.superbenemies.entity.dummy
 
 import com.teamuhi.superbenemies.config.DummyConfig
+import com.teamuhi.superbenemies.debug.AiKind
 import com.teamuhi.superbenemies.entity.dummy.ai.DummyAi
 import com.teamuhi.superbenemies.entity.dummy.ai.DummyHideGoal
 import com.teamuhi.superbenemies.entity.dummy.ai.DummyLookGoal
@@ -26,6 +27,8 @@ class PlayerDummyEntity(type: EntityType<out PathfinderMob>, level: Level) : Hum
 
     override val settings: DummySettings = PlayerDummySettings
 
+    override val aiKind: AiKind get() = AiKind.PLAYER_DUMMY
+
     override fun registerGoals() {
         goalSelector.addGoal(0, FloatGoal(this))
         goalSelector.addGoal(1, DummyHideGoal(this))
@@ -39,7 +42,11 @@ class PlayerDummyEntity(type: EntityType<out PathfinderMob>, level: Level) : Hum
     override fun coverEnabled(): Boolean = DummyConfig.HIDE_FROM_BOSSES.get()
 
     /** With `hideFromBosses` on: whenever a live, uncrippled boss is within [DummyAi.BOSS_RANGE] blocks. */
-    override fun wantsCover(): Boolean = coverEnabled() && DummyAi.nearestBoss(this, includeCrippled = false) != null
+    override fun wantsCover(): Boolean {
+        val wants = coverEnabled() && DummyAi.nearestBoss(this, includeCrippled = false) != null
+        thought.think("wantsCover") { if (wants) "yes: a boss is near" else if (!coverEnabled()) "no: hiding is switched off" else "no: no boss near" }
+        return wants
+    }
 
     companion object {
         /** Vanilla player walk speed (0.1), 20 health, and a 32 block follow range. */

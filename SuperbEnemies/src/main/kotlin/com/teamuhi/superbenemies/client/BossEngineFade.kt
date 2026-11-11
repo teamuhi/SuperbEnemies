@@ -2,7 +2,7 @@ package com.teamuhi.superbenemies.client
 
 import com.atsuishio.superbwarfare.entity.vehicle.base.VehicleEntity
 import com.teamuhi.superbenemies.SuperbEnemies
-import com.teamuhi.superbenemies.entity.boss.common.BossAircraft
+import com.teamuhi.superbenemies.entity.boss.common.BossVehicle
 import net.minecraft.client.Minecraft
 import net.minecraft.client.resources.sounds.AbstractTickableSoundInstance
 import net.minecraft.sounds.SoundEvent
@@ -22,7 +22,7 @@ import net.minecraftforge.fml.common.Mod
  * about a third of its volume. When a healthy boss leaves the client level this plays a continuation of the same
  * loop at its last position and velocity and fades it to nothing. Superb Warfare itself is not touched.
  *
- * Not used for a crippled boss or a wreck (the crash would keep droning after the explosion).
+ * Only for the aircraft (the ground bosses are heard well inside the range they are tracked at). Not used for a crippled boss or a wreck (the crash would keep droning after the explosion).
  */
 @Mod.EventBusSubscriber(modid = SuperbEnemies.MOD_ID, bus = Mod.EventBusSubscriber.Bus.FORGE, value = [Dist.CLIENT])
 object BossEngineFade {
@@ -38,7 +38,9 @@ object BossEngineFade {
         val level = event.level
         if (!level.isClientSide) return
         val entity = event.entity
-        if (entity !is VehicleEntity || entity !is BossAircraft) return
+        if (entity !is VehicleEntity || entity !is BossVehicle) return
+        // The tanks' engines are only audible out to a short range, well inside the tracking range: nothing to fade.
+        if (entity.groundBoss) return
 
         val mc = Minecraft.getInstance()
         // Disconnecting or changing dimension clears every entity; the sound manager stops its sounds anyway.

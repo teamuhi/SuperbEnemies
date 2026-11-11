@@ -5,8 +5,12 @@ import com.atsuishio.superbwarfare.entity.vehicle.Ac130hEntity
 import com.atsuishio.superbwarfare.init.ModDamageTypes
 import com.teamuhi.superbenemies.SuperbEnemies
 import com.teamuhi.superbenemies.config.Ac130Config
+import com.teamuhi.superbenemies.debug.AiKind
+import com.teamuhi.superbenemies.debug.AiThought
+import com.teamuhi.superbenemies.config.BossKind
+import com.teamuhi.superbenemies.config.TeammateSettings
 import com.teamuhi.superbenemies.entity.boss.ac130.ai.Ac130BossBrain
-import com.teamuhi.superbenemies.entity.boss.common.BossAircraft
+import com.teamuhi.superbenemies.entity.boss.common.air.BossAircraft
 import com.teamuhi.superbenemies.entity.boss.common.BossCrewEntity
 import com.teamuhi.superbenemies.entity.boss.common.BossLifecycle
 import com.teamuhi.superbenemies.entity.boss.common.BossLifecycleSettings
@@ -139,6 +143,13 @@ class Ac130BossEntity(type: EntityType<Ac130BossEntity>, level: Level) : Ac130hE
 
     override fun limitedAmmo(): Boolean = Ac130Config.LIMITED_AMMO.get()
 
+    override val bossKind: BossKind
+        get() = BossKind.AC130
+
+    override val thought: AiThought by lazy { AiThought(this, AiKind.AC130) { brain.state.name } }
+
+    override fun teammates(): TeammateSettings = Ac130Config.TEAMMATES
+
     override fun flareAmmoLoad(): Int = Ac130Config.FLARE_COUNT.get()
 
     /** Unit vector of the current heading in the horizontal plane (Minecraft yaw convention). */
@@ -151,6 +162,7 @@ class Ac130BossEntity(type: EntityType<Ac130BossEntity>, level: Level) : Ac130hE
 
     /** Called by the spawn egg before the entity is added: sets the home point and puts the gunship in the air. */
     override fun prepareLaunch(home: Vec3) {
+        thought.event("entity.prepareLaunch") { "launched into the air, home ${home.x.toInt()}, ${home.y.toInt()}, ${home.z.toInt()}" }
         homePos = home
         homeSet = true
         deltaMovement = horizontalLook().scale(LAUNCH_SPEED)
@@ -158,6 +170,21 @@ class Ac130BossEntity(type: EntityType<Ac130BossEntity>, level: Level) : Ac130hE
         engineStartOver = true
         gearUp = true
         synchedGearRot = 1f
+        power = LAUNCH_POWER
+    }
+
+    /** Tells the brain where the fight was, so a replacement that finds nobody circles there, not over the old spawn. */
+    override fun rememberFight(anchor: Vec3) = brain.rememberFight(anchor)
+
+    /**
+     * Puts the aircraft at [spot] in open air (the unstuck teleport, see `StuckWatch`): same heading, wings level, nose on
+     * the horizon, and launch speed and power so it flies on instead of stalling.
+     */
+    fun relaunch(spot: Vec3) {
+        thought.event("entity.relaunch") { "relaunched in open air: wings level, launch speed and power" }
+        moveTo(spot.x, spot.y, spot.z, yRot, 0f)
+        setZRot(0f)
+        deltaMovement = horizontalLook().scale(LAUNCH_SPEED)
         power = LAUNCH_POWER
     }
 
@@ -292,6 +319,17 @@ class Ac130BossEntity(type: EntityType<Ac130BossEntity>, level: Level) : Ac130hE
 
     // ================================================================================================== tick
 
+    /**
+     * The boss never presses the gear key, and Superb Warfare drops the gear whenever the aircraft touches the ground (and
+     * never raises it again by itself), so it is held up on both sides before and after the engine tick. A crippled
+     * aircraft and a wreck are left to Superb Warfare.
+     */
+    private fun holdGearUp() {
+        if (crippled || isWreck) return
+        gearUp = true
+        synchedGearRot = 1f
+    }
+
     override fun baseTick() {
         val server = !level().isClientSide
         if (server) {
@@ -309,7 +347,9 @@ class Ac130BossEntity(type: EntityType<Ac130BossEntity>, level: Level) : Ac130hE
             lifecycle.tickWounded()
         }
 
+        holdGearUp()
         super.baseTick()
+        holdGearUp()
 
         if (server) {
             // The gunners' rotation is read when SBW runs the (deferred) shot, so it has to be final after the tick.
@@ -378,11 +418,19 @@ class Ac130BossEntity(type: EntityType<Ac130BossEntity>, level: Level) : Ac130hE
 
     /**
      * The boss's own shells must not hurt it. SBW's friendly-fire check exempts explosion damage (`CUSTOM_EXPLOSION`)
-     * even from the crew, so filter it here. Collision damage still counts.
+     * even from the crew, so filter it here. Crash damage (`VEHICLE_STRIKE` with the plane itself as the direct entity)
+     * counts unless `collisionDamage` is off, except for a crippled plane or a wreck; a ram by another vehicle always
+     * counts.
      */
     override fun hurt(source: DamageSource, amount: Float): Boolean {
         val attacker = source.entity
         if ((attacker === this || isCrew(attacker)) && !source.`is`(ModDamageTypes.VEHICLE_STRIKE)) {
+            return false
+        }
+        // Skipping here also skips SBW's `crash` flag, so a scrape or bounce is harmless.
+        if (!Ac130Config.COLLISION_DAMAGE.get() && !crippled && !isWreck &&
+            source.`is`(ModDamageTypes.VEHICLE_STRIKE) && source.directEntity === this
+        ) {
             return false
         }
         val hurt = super.hurt(source, amount)

@@ -1,17 +1,20 @@
 package com.teamuhi.superbenemies.entity.boss.ac130.ai
 
 import com.atsuishio.superbwarfare.entity.vehicle.base.VehicleEntity
-import com.teamuhi.superbenemies.SuperbEnemies
 import com.teamuhi.superbenemies.config.Ac130Config
+import com.teamuhi.superbenemies.config.TargetCategory
 import com.teamuhi.superbenemies.config.TargetingMethod
+import com.teamuhi.superbenemies.debug.AiVision
 import com.teamuhi.superbenemies.entity.boss.ac130.Ac130BossEntity
 import com.teamuhi.superbenemies.entity.boss.common.BossCrewEntity
-import com.teamuhi.superbenemies.entity.boss.common.ai.FlightMath
+import com.teamuhi.superbenemies.entity.boss.common.air.FlightMath
 import com.teamuhi.superbenemies.entity.boss.common.ai.TargetChoice
-import com.teamuhi.superbenemies.entity.boss.common.ai.TargetSight
+import com.teamuhi.superbenemies.entity.boss.common.ai.LastKnownLocation
 import com.teamuhi.superbenemies.entity.boss.common.ai.TrackedVehicles
 import com.teamuhi.superbenemies.entity.boss.common.ai.categoryOf
+import com.teamuhi.superbenemies.entity.boss.common.ai.dedupeByRootVehicle
 import com.teamuhi.superbenemies.entity.boss.common.ai.isEnemyPlane
+import com.teamuhi.superbenemies.entity.boss.common.ai.isEnemyTank
 import com.teamuhi.superbenemies.entity.boss.common.ai.riddenBy
 import com.teamuhi.superbenemies.entity.dummy.HumanoidDummyEntity
 import com.teamuhi.superbenemies.entity.dummy.TrackedDummies
@@ -25,10 +28,10 @@ import net.minecraft.world.phys.Vec3
 import java.util.UUID
 
 /**
- * Target selection for the AC-130 boss. What it may attack is set by four weights (`playerWeight`, `mobWeight`,
- * `hostileMobWeight`, `planeWeight`, all re-read every tick, so setting one to 0 drops a target of that kind straight
- * away): 0 means never. `planeWeight` (experimental) hunts manned aircraft, see [isEnemyPlane]; they follow the player
- * range rule and the same choice rules.
+ * Target selection for the AC-130 boss. What it may attack is set by five weights (`playerWeight`, `mobWeight`,
+ * `hostileMobWeight`, `planeWeight`, `tankWeight`, all re-read every tick, so setting one to 0 drops a target of that kind straight
+ * away): 0 means never. `planeWeight` (experimental) hunts manned aircraft, see [isEnemyPlane], and `tankWeight`
+ * (experimental) manned armour, see [isEnemyTank]; both follow the player range rule and the same choice rules.
  *
  * Unlike the A-10 the gunship does not care what kind of thing it shells, so animals and villagers count the same as
  * monsters, apart from their own weight. Rules, in priority order: the last thing that hurt the boss (if it is a valid
@@ -47,7 +50,7 @@ import java.util.UUID
  * candidate's chance is proportional to its weight (see [randomChoice]).
  *
  * `targetingMethod` decides what the boss knows. STATIC always knows exactly where the target is. DYNAMIC loses sight of
- * a target that has a cover block above it (see [TargetSight]) and shells its last known position (the [aim] is then a
+ * a target that has a cover block above it (see [LastKnownLocation]) and shells its last known position (the [aim] is then a
  * ghost) instead, while the real [target] still decides validity. It also prefers exposed targets: the candidate pool
  * is the exposed ones, or the hidden ones only when none is exposed, and a hidden target is dropped at once (ignoring
  * [MIN_DWELL_TICKS]) when an exposed candidate exists.
@@ -64,7 +67,7 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
 
     /**
      * What the weapons aim at: the target itself, or the vehicle it rides. Under DYNAMIC, while the target is hidden, a
-     * ghost at its last known position (see [TargetSight]); validity and scans always use [target], never this.
+     * ghost at its last known position (see [LastKnownLocation]); validity and scans always use [target], never this.
      */
     var aim: Entity? = null
         private set
@@ -82,7 +85,8 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
     private var lastAimPosition: Vec3 = Vec3.ZERO
     private var trackedAimId = -1
 
-    private val sight = TargetSight(boss)
+    /** The ghost of a covered target and the remembered target positions; the brain reads [LastKnownLocation.anchor] from it. */
+    val lastKnown = LastKnownLocation(boss, graceSeconds = { Ac130Config.SIGHT_LOSS_GRACE_SECONDS.get() })
 
     /** The weight of [entity]'s category; 0 for something that is no target at all. */
     private fun weightOf(entity: Entity): Int = Ac130Config.WEIGHTS.of(categoryOf(entity))
@@ -115,6 +119,8 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
             target = current
         }
         if (current != null && !stillValid(current)) {
+            val lost = current
+            boss.thought.event("targeting.update") { "lost target ${lost.name.string}: no longer valid or out of reach" }
             drop()
             current = null
             // Look for a replacement soon instead of idling for up to a full scan interval.
@@ -128,11 +134,14 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
             current = target
         }
 
-        val wasHidden = sight.hidden
-        aim = sight.resolve(current?.rootVehicle, Ac130Config.TARGETING_METHOD.get())
+        val wasHidden = lastKnown.hidden
+        aim = lastKnown.resolve(current?.rootVehicle, Ac130Config.TARGETING_METHOD.get())
         // The target just lost its sight line: look for an exposed one now instead of up to a full scan interval later.
-        if (!wasHidden && sight.hidden) nextScanTick = minOf(nextScanTick, now + RESCAN_AFTER_LOSS)
+        if (!wasHidden && lastKnown.hidden) nextScanTick = minOf(nextScanTick, now + RESCAN_AFTER_LOSS)
         trackAim(aim)
+        if (boss.thought.enabled) {
+            AiVision.report(boss, boss.thought, boss.eyePosition, current, aim, lastKnown.visionState(aim), lastKnown.graceLeftTicks)
+        }
     }
 
     private fun drop() {
@@ -140,7 +149,7 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
         targetUuid = null
         aim = null
         trackedAimId = -1
-        sight.reset()
+        lastKnown.reset()
     }
 
     /** The next tick at which `(tick + id) % SCAN_INTERVAL == 0`, so bosses spread their scans over the interval. */
@@ -153,6 +162,9 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
     fun snapToAnotherTarget(level: ServerLevel, orbitRadius: Double): Boolean {
         val previous = target
         pickTarget(level, orbitRadius, forceAlternate = true)
+        boss.thought.event("targeting.snapToAnotherTarget") {
+            if (target !== previous) "long burst: switched to ${target?.name?.string ?: "nobody"}" else "long burst: no other target to switch to"
+        }
         return target !== previous
     }
 
@@ -161,7 +173,7 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
     /** Cheap per-tick check of the current target. Heavy conditions (sky exposure, scan box) are scan-only. */
     private fun stillValid(entity: Entity): Boolean {
         if (!entity.isAlive || entity.isRemoved || entity.level() !== boss.level()) return false
-        if (entity is VehicleEntity) return validPlane(entity, lose = true)
+        if (entity is VehicleEntity) return validVehicle(entity, lose = true)
         if (entity is ServerPlayer) return validPlayer(entity, lose = true)
         if (entity is HumanoidDummyEntity && dummiesArePlayers(entity)) return validDummy(entity, lose = true)
         if (entity !is Mob) return false
@@ -179,13 +191,22 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
         return dx * dx + dz * dz <= limit * limit
     }
 
-    /** An aircraft for a plane weight above 0 (see [isEnemyPlane]) under the player range rule: [lose] widens it for a held target. */
-    private fun validPlane(plane: Entity, lose: Boolean): Boolean {
-        if (!Ac130Config.WEIGHTS.allowsPlanes || !isEnemyPlane(boss, plane)) return false
+    /**
+     * An aircraft for a plane weight above 0 (see [isEnemyPlane]) or armour for a tank weight above 0 (see
+     * [isEnemyTank]) under the player range rule: [lose] widens it for a held target.
+     */
+    private fun validVehicle(vehicle: Entity, lose: Boolean): Boolean {
+        val weights = Ac130Config.WEIGHTS
+        val enemy = when (categoryOf(vehicle)) {
+            TargetCategory.PLANE -> weights.allowsPlanes && isEnemyPlane(boss, vehicle)
+            TargetCategory.TANK -> weights.allowsTanks && isEnemyTank(boss, vehicle)
+            else -> false
+        }
+        if (!enemy) return false
         if (Ac130Config.GLOBAL_AGGRO.get()) return true
         val limit = Ac130Config.AGGRO_RANGE.get() * (if (lose) LOSE_TARGET_FACTOR else 1.0)
-        val dx = plane.x - boss.x
-        val dz = plane.z - boss.z
+        val dx = vehicle.x - boss.x
+        val dz = vehicle.z - boss.z
         return dx * dx + dz * dz <= limit * limit
     }
 
@@ -224,11 +245,13 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
         val weights = Ac130Config.WEIGHTS
         val method = Ac130Config.TARGETING_METHOD.get()
 
-        val candidates = ArrayList<Entity>()
+        val rawCandidates = ArrayList<Entity>()
         if (weights.allowsPlayers) {
             for (player in level.players()) {
-                if (validPlayer(player, lose = false) && (global || FlightMath.horizontalDistance(player.position(), bossPos) <= aggro)) {
-                    candidates.add(player)
+                if (validPlayer(player, lose = false) &&
+                    (global || FlightMath.horizontalDistance(player.position(), bossPos) <= aggro)
+                ) {
+                    rawCandidates.add(player)
                 }
             }
         }
@@ -237,14 +260,14 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
                 if (dummy is HumanoidDummyEntity && dummiesArePlayers(dummy) && validDummy(dummy, lose = false) &&
                     (global || FlightMath.horizontalDistance(dummy.position(), bossPos) <= aggro)
                 ) {
-                    candidates.add(dummy)
+                    rawCandidates.add(dummy)
                 }
             }
         }
-        if (weights.allowsPlanes) {
-            for (plane in TrackedVehicles.all(level)) {
-                if (validPlane(plane, lose = false) && (global || FlightMath.horizontalDistance(plane.position(), bossPos) <= aggro)) {
-                    candidates.add(plane)
+        if (weights.allowsVehicles) {
+            for (vehicle in TrackedVehicles.all(level)) {
+                if (validVehicle(vehicle, lose = false) && (global || FlightMath.horizontalDistance(vehicle.position(), bossPos) <= aggro)) {
+                    rawCandidates.add(vehicle)
                 }
             }
         }
@@ -254,16 +277,21 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
                 boss.x - reach, level.minBuildHeight.toDouble(), boss.z - reach,
                 boss.x + reach, level.maxBuildHeight.toDouble(), boss.z + reach
             )
-            candidates.addAll(level.getEntitiesOfClass(Mob::class.java, box) { eligibleMob(it) })
+            rawCandidates.addAll(level.getEntitiesOfClass(Mob::class.java, box) { eligibleMob(it) })
         }
 
         // A player slightly beyond the aggro range keeps its lock until the (wider) lose range.
-        val held = target?.takeIf { t ->
-            candidates.any { it === t } || (t is ServerPlayer && validPlayer(t, lose = true)) ||
+        val rawHeld = target?.takeIf { t ->
+            rawCandidates.any { it === t } || (t is ServerPlayer && validPlayer(t, lose = true)) ||
                     (t is HumanoidDummyEntity && dummiesArePlayers(t) && validDummy(t, lose = true)) ||
-                    (t is VehicleEntity && validPlane(t, lose = true))
+                    (t is VehicleEntity && validVehicle(t, lose = true))
         }
-        if (held != null && candidates.none { it === held }) candidates.add(held)
+        if (rawHeld != null && rawCandidates.none { it === rawHeld }) rawCandidates.add(rawHeld)
+
+        // A player riding a vehicle is listed twice (player and vehicle): keep the one with the higher weight. A held
+        // target that lost that contest is replaced by the entry of its vehicle, so the lock is not dropped by it.
+        val candidates = dedupeByRootVehicle(rawCandidates, this::weightOf)
+        val held = rawHeld?.let { h -> candidates.firstOrNull { it === h } ?: candidates.firstOrNull { it.rootVehicle === h.rootVehicle } }
 
         fun distance(entity: Entity) = FlightMath.horizontalDistance(entity.position(), bossPos)
         fun score(entity: Entity) = TargetChoice.score(distance(entity), weightOf(entity))
@@ -274,7 +302,7 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
         var effectiveHeld = held
         var hiddenCount = 0
         if (method == TargetingMethod.DYNAMIC) {
-            val (hidden, exposed) = candidates.partition { sight.isHidden(it, method) }
+            val (hidden, exposed) = candidates.partition { lastKnown.isHidden(it, method) }
             hiddenCount = hidden.size
             pool = exposed.ifEmpty { hidden }
             if (effectiveHeld != null && exposed.isNotEmpty() && hidden.any { it === effectiveHeld }) effectiveHeld = null
@@ -301,14 +329,25 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
             }
         }
 
+        val why = when {
+            forceAlternate -> "alternate target for a long burst"
+            Ac130Config.RANDOM_TARGETING.get() ->
+                if (chosen != null && chosen === effectiveHeld) "held, redraw not due" else "random draw by weight"
+            attacker != null && chosen === attacker -> "most recent attacker"
+            chosen != null && chosen === effectiveHeld ->
+                if (chosen === best) "held, still the best score" else "held target"
+            chosen != null && chosen === best ->
+                if (effectiveHeld != null) "better score than the held target" else "best weighted distance"
+            else -> "no candidate"
+        }
+        boss.thought.think("targeting.pickTarget") {
+            if (chosen == null) "no target in reach" else "target ${chosen.name.string}: $why"
+        }
         if (chosen !== target) {
             trackedAimId = -1 // new target: forget the old motion estimate
             lastSwitchTick = now
-            if (Ac130Config.DEBUG_LOGGING.get()) {
-                SuperbEnemies.LOGGER.info(
-                    "[AC-130 boss] target {} -> {} ({} candidates, {} hidden)",
-                    target?.name?.string ?: "none", chosen?.name?.string ?: "none", candidates.size, hiddenCount
-                )
+            boss.thought.event("targeting.pickTarget") {
+                "target ${target?.name?.string ?: "none"} -> ${chosen?.name?.string ?: "none"} ($why; ${candidates.size} candidates, $hiddenCount hidden)"
             }
         }
         target = chosen
@@ -344,8 +383,8 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
                 if (dummy is HumanoidDummyEntity && dummiesArePlayers(dummy) && validDummy(dummy, lose = true)) found.add(dummy)
             }
         }
-        if (weights.allowsPlanes) {
-            for (plane in TrackedVehicles.all(level)) if (validPlane(plane, lose = true)) found.add(plane)
+        if (weights.allowsVehicles) {
+            for (vehicle in TrackedVehicles.all(level)) if (validVehicle(vehicle, lose = true)) found.add(vehicle)
         }
         if (weights.allowsMobs) {
             val box = AABB(
@@ -356,11 +395,12 @@ class Ac130Targeting(private val boss: Ac130BossEntity) {
         }
         val origin = primary.position()
         return found.asSequence()
-            .filter { !sight.isHidden(it, method) }
+            .filter { !lastKnown.isHidden(it, method) }
             .map { it.rootVehicle to weightOf(it) }
             .filter { (root, _) -> root.id != primary.id && FlightMath.horizontalDistance(root.position(), origin) <= radius }
-            .distinctBy { (root, _) -> root.id }
+            // Best score first, then one entry per vehicle: a rider and its vehicle both qualify, the higher weight wins.
             .sortedBy { (root, weight) -> TargetChoice.score(FlightMath.horizontalDistance(root.position(), origin), weight) }
+            .distinctBy { (root, _) -> root.id }
             .take(max)
             .map { (root, _) -> root }
             .toList()

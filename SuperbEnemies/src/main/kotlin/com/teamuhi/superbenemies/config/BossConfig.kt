@@ -16,12 +16,14 @@ object BossConfig {
     val AGGRO_RANGE: ForgeConfigSpec.IntValue
     val GLOBAL_AGGRO: ForgeConfigSpec.BooleanValue
     val TARGETING_METHOD: ForgeConfigSpec.EnumValue<TargetingMethod>
+    val SIGHT_LOSS_GRACE_SECONDS: ForgeConfigSpec.IntValue
     val PLAYER_WEIGHT: ForgeConfigSpec.IntValue
     val MOB_WEIGHT: ForgeConfigSpec.IntValue
     val HOSTILE_MOB_WEIGHT: ForgeConfigSpec.IntValue
     val PLANE_WEIGHT: ForgeConfigSpec.IntValue
+    val TANK_WEIGHT: ForgeConfigSpec.IntValue
 
-    /** The four weight options as one object, for classifying a target by [TargetCategory]. */
+    /** The five weight options as one object, for classifying a target by [TargetCategory]. */
     val WEIGHTS: TargetWeights
     val MOB_SCAN_RANGE: ForgeConfigSpec.IntValue
     val RANDOM_TARGETING: ForgeConfigSpec.BooleanValue
@@ -57,6 +59,8 @@ object BossConfig {
     val MISSILE_COUNT: ForgeConfigSpec.IntValue
     val FLARE_COUNT: ForgeConfigSpec.IntValue
     val RESUPPLY_SECONDS: ForgeConfigSpec.IntValue
+    val IDLE_RESUPPLY_SECONDS: ForgeConfigSpec.IntValue
+    val IDLE_RESUPPLY_CHANCE: ForgeConfigSpec.IntValue
 
     val DEFENSIVE_FLARES: ForgeConfigSpec.BooleanValue
     val FLARE_MISS_CHANCE: ForgeConfigSpec.IntValue
@@ -65,11 +69,17 @@ object BossConfig {
     val CLIMB_FLARE_CHANCE: ForgeConfigSpec.IntValue
     val SIDE_FLARES_CHANCE: ForgeConfigSpec.IntValue
     val TAUNT_ENABLED: ForgeConfigSpec.BooleanValue
+    val LAST_KNOWN_STRIKE_SECONDS: ForgeConfigSpec.IntValue
     val IGNORE_BLOCK_COLLISIONS: ForgeConfigSpec.BooleanValue
+    val COLLISION_DAMAGE: ForgeConfigSpec.BooleanValue
+    val UNSTUCK_TELEPORT: ForgeConfigSpec.BooleanValue
+    val UNSTUCK_SECONDS: ForgeConfigSpec.IntValue
     val BOSS_BAR_RANGE: ForgeConfigSpec.IntValue
     val XP_REWARD: ForgeConfigSpec.IntValue
     val BLOCK_DAMAGE: ForgeConfigSpec.BooleanValue
-    val DEBUG_LOGGING: ForgeConfigSpec.BooleanValue
+
+    /** Which boss types this boss counts as teammates (never targeted). */
+    val TEAMMATES: TeammateSettings
 
     /** Every option in file order (grouped by section); the in-game config screen is built from this. */
     val ALL: List<ForgeConfigSpec.ConfigValue<*>>
@@ -108,6 +118,15 @@ object BossConfig {
             )
             .defineEnum("targetingMethod", TargetingMethod.DYNAMIC)
 
+        SIGHT_LOSS_GRACE_SECONDS = b
+            .comment(
+                "DYNAMIC targeting only. How many seconds the boss keeps tracking a target's real position after it breaks",
+                "line of sight, as a general sense of where it went, before it finally loses sight and falls back to the last",
+                "spot it saw it at. A target that was hidden when first chosen gets no grace. 0 = off: sight is lost at once.",
+                "Everything that counts from losing sight (last-known strikes, searching, giving up) starts after this time."
+            )
+            .defineInRange("sightLossGraceSeconds", 5, 0, 30)
+
         PLAYER_WEIGHT = b
             .comment(
                 "How much the boss wants to attack players (and player dummies that bosses target), from 0 to 5. 0 = never.",
@@ -129,12 +148,19 @@ object BossConfig {
 
         PLANE_WEIGHT = b
             .comment(
-                "EXPERIMENTAL. Same for manned airplanes and helicopters and for other bosses. 0 = never.",
+                "EXPERIMENTAL. Same for manned airplanes, helicopters and airships and for other plane bosses. 0 = never.",
                 "The normal attack patterns are reused, so fast movers are often missed."
             )
             .defineInRange("planeWeight", 0, 0, MAX_TARGET_WEIGHT)
 
-        WEIGHTS = TargetWeights(PLAYER_WEIGHT, MOB_WEIGHT, HOSTILE_MOB_WEIGHT, PLANE_WEIGHT)
+        TANK_WEIGHT = b
+            .comment(
+                "EXPERIMENTAL. Same for manned tanks, APCs and anti-air vehicles (and the tank bosses). 0 = never.",
+                "Under DYNAMIC targeting a tank hidden in smoke is attacked at the spot where it was last seen."
+            )
+            .defineInRange("tankWeight", 0, 0, MAX_TARGET_WEIGHT)
+
+        WEIGHTS = TargetWeights(PLAYER_WEIGHT, MOB_WEIGHT, HOSTILE_MOB_WEIGHT, PLANE_WEIGHT, TANK_WEIGHT)
 
         MOB_SCAN_RANGE = b
             .comment("Range (blocks) in which mobs are considered as targets, whatever globalAggro says. Only used when mobWeight or hostileMobWeight is above 0.")
@@ -248,6 +274,15 @@ object BossConfig {
         RESUPPLY_SECONDS = b
             .comment("Seconds a withdrawn boss stays gone before its replacement (same health, full load) appears near the fight. The flight away is extra.")
             .defineInRange("resupplySeconds", 40, 0, 3_600)
+        IDLE_RESUPPLY_SECONDS = b
+            .comment(
+                "Seconds without a target after which a boss with some ammo or flares spent may leave to rearm",
+                "(needs limitedAmmo). 0 = never; a full load never triggers it."
+            )
+            .defineInRange("idleResupplySeconds", 120, 0, 3_600)
+        IDLE_RESUPPLY_CHANCE = b
+            .comment("Chance (percent) rolled every 10 seconds once idleResupplySeconds has passed, to go and rearm.")
+            .defineInRange("idleResupplyChance", 25, 0, 100)
 
         b.pop().push("behaviour")
 
@@ -279,12 +314,37 @@ object BossConfig {
             .comment("Whether the boss may taunt: a low flyby or barrel roll near the player, dropping flares. Harmless.")
             .define("tauntEnabled", true)
 
+        LAST_KNOWN_STRIKE_SECONDS = b
+            .comment(
+                "Seconds the boss keeps attacking the spot where it lost its target (out of range or no longer valid)",
+                "before it goes back to circling. A new target ends it early. 0 = off."
+            )
+            .defineInRange("lastKnownStrikeSeconds", 20, 0, 300)
+
         IGNORE_BLOCK_COLLISIONS = b
             .comment(
                 "Fly straight through terrain and buildings with no collision damage. A crippled boss collides",
                 "normally again so its wreck still crashes."
             )
             .define("ignoreBlockCollisions", false)
+
+        COLLISION_DAMAGE = b
+            .comment(
+                "Take damage when hitting terrain or buildings. Off: the plane still collides and bounces but takes no",
+                "crash damage. A crippled plane always takes it."
+            )
+            .define("collisionDamage", true)
+
+        UNSTUCK_TELEPORT = b
+            .comment(
+                "Teleport the plane up into open air when it has stayed within a few blocks of one spot for",
+                "unstuckSeconds (wedged in terrain or a building). It keeps its heading and flies on."
+            )
+            .define("unstuckTeleport", true)
+
+        UNSTUCK_SECONDS = b
+            .comment("Seconds a plane may stay on one spot before unstuckTeleport moves it.")
+            .defineInRange("unstuckSeconds", 15, 5, 300)
 
         BOSS_BAR_RANGE = b
             .comment("Players within this many blocks see the boss bar.")
@@ -294,25 +354,27 @@ object BossConfig {
             .comment("Experience dropped when the boss is defeated.")
             .defineInRange("xpReward", 500, 0, 100_000)
 
-        DEBUG_LOGGING = b
-            .comment("Log bomb-run solutions (predicted miss distance at release) to the server log.")
-            .define("debugLogging", false)
+        b.pop()
+
+        TEAMMATES = defineTeammates(b, "a10", BossKind.A10)
 
         b.pop()
         SPEC = b.build()
 
-        SLIDERS = listOf(PLAYER_WEIGHT, MOB_WEIGHT, HOSTILE_MOB_WEIGHT, PLANE_WEIGHT).associateWith { 0..MAX_TARGET_WEIGHT }
+        SLIDERS = listOf<ForgeConfigSpec.ConfigValue<*>>(PLAYER_WEIGHT, MOB_WEIGHT, HOSTILE_MOB_WEIGHT, PLANE_WEIGHT, TANK_WEIGHT)
+            .associateWith { 0..MAX_TARGET_WEIGHT } + (SIGHT_LOSS_GRACE_SECONDS to 0..30)
 
         ALL = listOf(
-            MAX_HEALTH, CRUISE_HEIGHT, AGGRO_RANGE, GLOBAL_AGGRO, TARGETING_METHOD, PLAYER_WEIGHT, MOB_WEIGHT, HOSTILE_MOB_WEIGHT, PLANE_WEIGHT,
+            MAX_HEALTH, CRUISE_HEIGHT, AGGRO_RANGE, GLOBAL_AGGRO, TARGETING_METHOD, SIGHT_LOSS_GRACE_SECONDS, PLAYER_WEIGHT, MOB_WEIGHT, HOSTILE_MOB_WEIGHT, PLANE_WEIGHT, TANK_WEIGHT,
             MOB_SCAN_RANGE, RANDOM_TARGETING, ORBIT_RADIUS,
             CANNON_DAMAGE_MULT, ROCKET_DAMAGE_MULT, BOMB_DAMAGE_MULT, MISSILE_DAMAGE_MULT, BLOCK_DAMAGE,
             CANNON_ENABLED, ROCKETS_ENABLED, BOMBS_ENABLED, MISSILES_ENABLED,
             GUN_RUN_CHANCE, GUN_RUN_BOMB_CHANCE, ROCKET_RUN_CHANCE, BOMB_RUN_CHANCE, NUKE_ENABLED, NUKE_RUN_CHANCE, MISSILE_ORBIT_CHANCE,
             ROCKET_MISSILE_RUN_CHANCE, DOUBLE_GUN_RUN_CHANCE, CANNON_ROCKET_STALL_CHANCE, ROCKET_BOMB_STALL_CHANCE,
             LIMITED_AMMO, CANNON_ROUNDS, ROCKET_COUNT, BOMB_COUNT, NUKE_COUNT, MISSILE_COUNT, FLARE_COUNT, RESUPPLY_SECONDS,
+            IDLE_RESUPPLY_SECONDS, IDLE_RESUPPLY_CHANCE,
             DEFENSIVE_FLARES, FLARE_MISS_CHANCE, DEFAULT_FLARE_CHANCE, BARREL_ROLL_FLARE_CHANCE, CLIMB_FLARE_CHANCE,
-            SIDE_FLARES_CHANCE, TAUNT_ENABLED, IGNORE_BLOCK_COLLISIONS, BOSS_BAR_RANGE, XP_REWARD, DEBUG_LOGGING
-        )
+            SIDE_FLARES_CHANCE, TAUNT_ENABLED, LAST_KNOWN_STRIKE_SECONDS, IGNORE_BLOCK_COLLISIONS, COLLISION_DAMAGE, UNSTUCK_TELEPORT, UNSTUCK_SECONDS, BOSS_BAR_RANGE, XP_REWARD
+        ) + TEAMMATES.toggles.values
     }
 }

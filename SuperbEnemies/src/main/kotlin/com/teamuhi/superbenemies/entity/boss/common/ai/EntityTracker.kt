@@ -1,7 +1,7 @@
 package com.teamuhi.superbenemies.entity.boss.common.ai
 
 import com.atsuishio.superbwarfare.entity.projectile.ITrackableProjectile
-import com.teamuhi.superbenemies.entity.boss.common.BossAircraft
+import com.teamuhi.superbenemies.entity.boss.common.BossVehicle
 import net.minecraft.world.entity.Entity
 import net.minecraft.world.level.Level
 import net.minecraft.world.phys.Vec3
@@ -82,5 +82,5 @@ class EntityTracker(private val accepts: (Entity) -> Boolean) {
 /** Every guided projectile (anything implementing SBW's [ITrackableProjectile]); read by [ThreatMonitor]. */
 val TrackedProjectiles = EntityTracker { it is ITrackableProjectile }
 
-/** Every boss aircraft; read by the player dummy to look at and hide from them. */
-val TrackedBosses = EntityTracker { it is BossAircraft }
+/** Every boss vehicle (planes and ground bosses). The player dummy and the soldier cast to BossAircraft, so they only react to planes. */
+val TrackedBosses = EntityTracker { it is BossVehicle }

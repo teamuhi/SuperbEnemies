@@ -32,6 +32,8 @@ import net.minecraft.world.phys.Vec3
  * @param globalAggro when true every player in the dimension sees the bar
  * @param trailBack how far behind the entity's origin the crash fire trail starts, in blocks
  * @param trailUp how far above the entity's origin the crash fire trail starts, in blocks
+ * @param canCripple false for a boss that fights to the last point of health (the tanks): there is no crippled phase at 10%,
+ *        the boss bar empties at 0, and the loot / XP are paid out as soon as Superb Warfare declares the wreck
  */
 class BossLifecycleSettings(
     val lootTable: ResourceLocation,
@@ -43,7 +45,8 @@ class BossLifecycleSettings(
     val bossBarRange: () -> Int,
     val globalAggro: () -> Boolean,
     val trailBack: Double = 5.0,
-    val trailUp: Double = 1.8
+    val trailUp: Double = 1.8,
+    val canCripple: Boolean = true
 )
 
 /**
@@ -62,7 +65,7 @@ class BossLifecycleSettings(
 class BossLifecycle<T>(
     private val boss: T,
     private val settings: BossLifecycleSettings
-) where T : VehicleEntity, T : BossAircraft {
+) where T : VehicleEntity, T : BossVehicle {
 
     /**
      * True once health has dropped to 10% of the maximum. From then on the plane is lost: the brain releases the
@@ -86,9 +89,9 @@ class BossLifecycle<T>(
 
     // ================================================================================================== tick
 
-    /** Switches to the crippled state once health reaches the threshold. Run before the AI so it sees the flag. */
+    /** Switches to the crippled state once health reaches the threshold (never when [BossLifecycleSettings.canCripple] is false). Run before the AI so it sees the flag. */
     fun checkCripple() {
-        if (!crippled && boss.healthFraction() <= CRIPPLE_FRACTION) enterCrippled()
+        if (settings.canCripple && !crippled && boss.healthFraction() <= CRIPPLE_FRACTION) enterCrippled()
     }
 
     /** Crash handling while crippled, otherwise a light smoke trail in the final phase. Run after the AI. */
@@ -104,20 +107,25 @@ class BossLifecycle<T>(
     }
 
     private fun checkDefeat() {
-        if (!defeated && boss.isWreck && boss.sympatheticDetonated) {
+        // A boss that cannot be crippled is beaten the moment its wreck is declared; the others wait for the crash explosion.
+        if (!defeated && boss.isWreck && (boss.sympatheticDetonated || !settings.canCripple)) {
             onDefeated()
             defeatTick = boss.tickCount
         }
-        // Give the queued crash explosion a few ticks to go off before the wreck disappears.
-        if (defeated && boss.tickCount - defeatTick >= DISCARD_DELAY_TICKS) boss.discard()
+        // Give the queued crash explosion a few ticks to go off before the wreck disappears; a wreck that stays a wreck (a tank) burns for a while first.
+        val delay = if (settings.canCripple) DISCARD_DELAY_TICKS else WRECK_LINGER_TICKS
+        if (defeated && boss.tickCount - defeatTick >= delay) {
+            boss.thought.event("lifecycle.checkDefeat") { "wreck removed after the payout" }
+            boss.discard()
+        }
     }
 
     // ================================================================================================== boss bar
 
     private fun updateBossBar() {
         val max = boss.getMaxHealth()
-        val floor = max * 0.1f
-        // Full at full health, empty exactly when the crash branch starts.
+        val floor = if (settings.canCripple) max * CRIPPLE_FRACTION else 0f
+        // Full at full health, empty exactly when the crash branch starts (at 0 for a boss that cannot be crippled).
         bossEvent.progress = if (max > floor) ((boss.health - floor) / (max - floor)).coerceIn(0f, 1f) else 0f
 
         if ((boss.tickCount + boss.id) % BAR_SYNC_INTERVAL == 0 && !defeated) {
@@ -175,6 +183,7 @@ class BossLifecycle<T>(
         crippled = true
         crippledTicks = 0
         bossEvent.progress = 0f
+        boss.thought.event("lifecycle.enterCrippled") { "crippled at ${(boss.healthFraction() * 100).toInt()}% health: controls released, crash trail on" }
         broadcast(settings.crippledMessageKey, ChatFormatting.RED)
     }
 
@@ -190,8 +199,10 @@ class BossLifecycle<T>(
 
         if (!boss.isWreck) {
             if (boss.onGround() || boss.isInFluidType) {
+                boss.thought.event("lifecycle.tickCrippled") { "crash: touched ${if (boss.onGround()) "the ground" else "water"}, declaring the wreck" }
                 boss.health = 0f
             } else if (crippledTicks % CRIPPLED_DRAIN_INTERVAL == 0) {
+                boss.thought.think("lifecycle.tickCrippled") { "crashing, burning down in the air" }
                 boss.health = boss.health - boss.getMaxHealth() * CRIPPLED_DRAIN
             }
         }
@@ -201,6 +212,7 @@ class BossLifecycle<T>(
     /** Detonates the wreck in the air if it never reached the ground (stuck, or the timeout elapsed). */
     private fun forceDetonation() {
         if (boss.sympatheticDetonated) return
+        boss.thought.event("lifecycle.forceDetonation") { "crash timed out in the air: detonating the wreck" }
         if (!boss.isWreck) {
             boss.health = 0f
             boss.isWreck = true
@@ -226,6 +238,7 @@ class BossLifecycle<T>(
 
         val xp = settings.xpReward()
         if (xp > 0) ExperienceOrb.award(level, boss.position(), xp)
+        boss.thought.event("lifecycle.onDefeated") { "defeated: loot table ${settings.lootTable} rolled, $xp xp paid out" }
 
         broadcast(settings.defeatedMessageKey, ChatFormatting.GOLD)
         bossEvent.progress = 0f
@@ -270,7 +283,9 @@ class BossLifecycle<T>(
      * removed (void, `/kill`, other mods) before the normal defeat path ran, then the boss bar is cleared.
      */
     fun onRemove(reason: Entity.RemovalReason) {
-        if (!defeated && crippled && (reason == Entity.RemovalReason.KILLED || reason == Entity.RemovalReason.DISCARDED)) {
+        val down = crippled || (!settings.canCripple && boss.isWreck)
+        if (!defeated && down && (reason == Entity.RemovalReason.KILLED || reason == Entity.RemovalReason.DISCARDED)) {
+            boss.thought.event("lifecycle.onRemove") { "removed before the payout ($reason): paying out now" }
             onDefeated()
         }
         bossEvent.removeAllPlayers()
@@ -285,7 +300,8 @@ class BossLifecycle<T>(
 
     fun load(tag: CompoundTag) {
         defeated = tag.getBoolean(TAG_DEFEATED)
-        crippled = tag.getBoolean(TAG_CRIPPLED)
+        // A tank saved while crippled by an older version fights on.
+        crippled = settings.canCripple && tag.getBoolean(TAG_CRIPPLED)
     }
 
     companion object {
@@ -301,6 +317,9 @@ class BossLifecycle<T>(
         private const val BAR_SYNC_INTERVAL = 20
         private const val UNDERGROUND_DEPTH = 8
         private const val DISCARD_DELAY_TICKS = 5
+
+        /** Ticks the wreck of a boss that cannot be crippled stays after the payout (the longest a crippled tank used to linger). */
+        private const val WRECK_LINGER_TICKS = 1200
         private const val TRAIL_RANGE_SQR = 300.0 * 300.0
     }
 }

@@ -20,8 +20,15 @@ object ModCreativeTabs {
             .displayItems { _, output ->
                 output.accept(ModItems.A10_BOSS_SPAWN_EGG.get())
                 output.accept(ModItems.AC130_BOSS_SPAWN_EGG.get())
+                output.accept(ModItems.LAV25_BOSS_SPAWN_EGG.get())
+                output.accept(ModItems.M1A2_BOSS_SPAWN_EGG.get())
+                output.accept(ModItems.BRADLEY_BOSS_SPAWN_EGG.get())
+                output.accept(ModItems.ZTZ99A_BOSS_SPAWN_EGG.get())
                 output.accept(ModItems.PLAYER_DUMMY_SPAWN_EGG.get())
                 output.accept(ModItems.DUMMY_SOLDIER_SPAWN_EGG.get())
+                output.accept(ModItems.JAVELIN_SOLDIER_SPAWN_EGG.get())
+                output.accept(ModItems.RPG_SOLDIER_SPAWN_EGG.get())
+                output.accept(ModItems.DRONE_SPAWN_EGG.get())
             }
             .build()
     }

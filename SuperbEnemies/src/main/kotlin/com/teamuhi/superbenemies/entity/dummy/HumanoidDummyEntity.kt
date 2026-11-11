@@ -1,5 +1,9 @@
 package com.teamuhi.superbenemies.entity.dummy
 
+import com.teamuhi.superbenemies.debug.AiKind
+import com.teamuhi.superbenemies.debug.AiThought
+import com.teamuhi.superbenemies.debug.runningGoalName
+import com.teamuhi.superbenemies.entity.dummy.ai.DummyAi
 import com.teamuhi.superbenemies.entity.dummy.ai.DummyHideGoal
 import com.teamuhi.superbenemies.entity.dummy.ai.DummyRoamGoal
 import com.teamuhi.superbenemies.entity.dummy.ai.DummyStrafeGoal
@@ -14,6 +18,7 @@ import net.minecraft.world.DifficultyInstance
 import net.minecraft.world.InteractionHand
 import net.minecraft.world.InteractionResult
 import net.minecraft.world.damagesource.DamageSource
+import net.minecraft.world.entity.Entity
 import net.minecraft.world.entity.EntityType
 import net.minecraft.world.entity.Mob
 import net.minecraft.world.entity.MobSpawnType
@@ -48,6 +53,12 @@ import kotlin.math.hypot
  */
 abstract class HumanoidDummyEntity(type: EntityType<out PathfinderMob>, level: Level) : PathfinderMob(type, level) {
 
+    /** Which AI Thinking filter this kind of dummy prints under. */
+    abstract val aiKind: AiKind
+
+    /** Console voice for the AI Thinking debug option; the state shown is the goal that is running. */
+    val thought: AiThought by lazy { AiThought(this, aiKind) { runningGoalName(this) } }
+
     /** Where this kind of dummy reads its health, armor, boss targeting and movement options from. */
     abstract val settings: DummySettings
 
@@ -65,6 +76,16 @@ abstract class HumanoidDummyEntity(type: EntityType<out PathfinderMob>, level: L
      * waiting out [coverMemoryTicks]. Read live.
      */
     open fun coverEnabled(): Boolean = true
+
+    /**
+     * What the look goal turns the dummy to face: the nearest boss, crippled or not, by default. A subclass that only cares
+     * about some bosses (the anti-tank soldiers watch the tanks) overrides it. Null = nobody: the look goal then falls back
+     * to the nearest player.
+     */
+    open fun lookThreat(): Entity? = DummyAi.nearestBoss(this, includeCrippled = true)
+
+    /** Extra fields for the AI Thinking heartbeat line (the launcher soldiers add their ammo). */
+    protected open fun heartbeatExtra(): String = ""
 
     /** The hide goal keeps hiding this many ticks after [wantsCover] went false, then walks back to the anchor. */
     open val coverMemoryTicks: Int get() = 100
@@ -162,6 +183,10 @@ abstract class HumanoidDummyEntity(type: EntityType<out PathfinderMob>, level: L
 
     override fun customServerAiStep() {
         super.customServerAiStep()
+        thought.heartbeat {
+            "goal=${runningGoalName(this)} threat=${lookThreat()?.name?.string ?: "none"} hp=${(health / maxHealth * 100f).toInt()}% " +
+                "pos=${blockPosition().toShortString()} ${heartbeatExtra()}".trimEnd()
+        }
         if (anchor == null) anchor = blockPosition() // /summon: no finalizeSpawn
         keepAnchorReachable()
         if (!attributesSynced || tickCount % ATTRIBUTE_SYNC_INTERVAL == 0) syncAttributes()
@@ -176,6 +201,7 @@ abstract class HumanoidDummyEntity(type: EntityType<out PathfinderMob>, level: L
         val dz = z - (a.z + 0.5)
         if (dx * dx + dz * dz > MAX_ANCHOR_DISTANCE * MAX_ANCHOR_DISTANCE || abs(y - a.y) > MAX_ANCHOR_HEIGHT) {
             anchor = blockPosition()
+            thought.event("keepAnchorReachable") { "moved far from the anchor, new anchor at ${anchor?.toShortString()}" }
         }
     }
 
@@ -248,6 +274,7 @@ abstract class HumanoidDummyEntity(type: EntityType<out PathfinderMob>, level: L
         if (level().isClientSide || !isAlive) return super.hurt(source, amount)
         if (settings.invulnerable() && !source.`is`(DamageTypeTags.BYPASSES_INVULNERABILITY)) {
             if (amount > 0f) lastHit = amount
+            thought.think("hurt") { "under fire from ${source.msgId} while invulnerable, not hurt" }
             if (tickCount - lastFlashTick >= FLASH_INTERVAL) {
                 lastFlashTick = tickCount
                 level().broadcastDamageEvent(this, source)
@@ -257,7 +284,10 @@ abstract class HumanoidDummyEntity(type: EntityType<out PathfinderMob>, level: L
         val before = health
         val result = super.hurt(source, amount)
         val dealt = before - health
-        if (result && dealt > 0f) lastHit = dealt
+        if (result && dealt > 0f) {
+            lastHit = dealt
+            thought.event("hurt") { "took ${"%.1f".format(dealt)} damage from ${source.msgId}, ${(health / maxHealth * 100f).toInt()}% health left" }
+        }
         return result
     }
 
@@ -267,6 +297,7 @@ abstract class HumanoidDummyEntity(type: EntityType<out PathfinderMob>, level: L
      */
     override fun die(source: DamageSource) {
         val firstDeath = !isRemoved && !dead
+        thought.event("die") { "killed by ${source.msgId}" }
         super.die(source)
         val server = level().server ?: return
         if (!firstDeath || !settings.showDeathMessage()) return

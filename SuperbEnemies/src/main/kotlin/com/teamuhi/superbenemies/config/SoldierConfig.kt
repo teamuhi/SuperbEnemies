@@ -1,6 +1,7 @@
 package com.teamuhi.superbenemies.config
 
 import com.teamuhi.superbenemies.entity.dummy.DummySettings
+import com.teamuhi.superbenemies.entity.soldier.AmmoSettings
 import net.minecraftforge.common.ForgeConfigSpec
 
 enum class SoldierMovement {
@@ -277,4 +278,12 @@ object SoldierSettings : DummySettings {
     override fun jumping(): Boolean = SoldierConfig.STRAFE_JUMPING.get()
     override fun sprinting(): Boolean = SoldierConfig.STRAFE_SPRINTING.get()
     override fun crouching(): Boolean = SoldierConfig.STRAFE_CROUCHING.get()
+}
+
+/** The Igla soldier's ammo options: [SoldierConfig], read live. */
+object SoldierAmmo : AmmoSettings {
+    override fun unlimited(): Boolean = SoldierConfig.UNLIMITED_AMMO.get()
+    override fun capacity(): Int = SoldierConfig.MISSILES.get()
+    override fun reloadTicks(): Int = SoldierConfig.RELOAD_TICKS.get()
+    override fun resupplySeconds(): Int = SoldierConfig.RESUPPLY_SECONDS.get()
 }

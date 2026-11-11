@@ -3,7 +3,6 @@ package com.teamuhi.superbenemies.entity.boss.a10.ai
 import com.atsuishio.superbwarfare.data.gun.GunProp
 import com.atsuishio.superbwarfare.data.gun.ShootParameters
 import com.atsuishio.superbwarfare.tools.ProjectileCalculator
-import com.teamuhi.superbenemies.SuperbEnemies
 import com.teamuhi.superbenemies.config.BossConfig
 import com.teamuhi.superbenemies.entity.boss.a10.A10WarthogBossEntity
 import net.minecraft.nbt.CompoundTag
@@ -35,6 +34,7 @@ class FireControl(private val boss: A10WarthogBossEntity) {
 
     private var missileNextTick = 0
     private var rocketNextTick = 0
+    private var lastRocketShot = Int.MIN_VALUE / 2
 
     // scheduled bomb stick
     private var stickRemaining = 0
@@ -78,16 +78,23 @@ class FireControl(private val boss: A10WarthogBossEntity) {
     fun fireCannon(raze: Boolean = false): Boolean {
         val now = boss.tickCount
         if (!canShoot(CANNON)) {
+            boss.thought.think("fire.fireCannon") { "holding fire: ${blockedReason(CANNON)}" }
             cannonBurstEnd = 0
             cannonPauseUntil = max(cannonPauseUntil, now + 10)
             return false
         }
+        boss.thought.think("fire.fireCannon") { "cannon ready" }
         if (now - lastCannonCall > BURST_GAP_RESET) cannonBurstEnd = 0
         lastCannonCall = now
 
         if (now < cannonPauseUntil) return false
         // Razing an area wants long, almost continuous bursts; a precision strafe fires short ones.
-        if (cannonBurstEnd == 0) cannonBurstEnd = now + if (raze) between(40, 70) else between(10, 16)
+        if (cannonBurstEnd == 0) {
+            cannonBurstEnd = now + if (raze) between(40, 70) else between(10, 16)
+            boss.thought.event("fire.fireCannon") {
+                "cannon burst (${if (raze) "razing" else "strafe"}), ${cannonBurstEnd - now} ticks, rounds left ${roundsText(CANNON)}"
+            }
+        }
         if (now >= cannonBurstEnd) {
             cannonBurstEnd = 0
             cannonPauseUntil = now + scaled(if (raze) between(3, 6) else between(8, 14))
@@ -131,14 +138,22 @@ class FireControl(private val boss: A10WarthogBossEntity) {
     fun fireMissile(target: Entity, guided: Boolean = true): Boolean {
         val now = boss.tickCount
         if (now < missileNextTick) return false
-        if (!pilotSeated() || !canShoot(MISSILE)) return false
+        if (!pilotSeated() || !canShoot(MISSILE)) {
+            boss.thought.think("fire.fireMissile") { "holding fire: ${if (!pilotSeated()) "no pilot seated" else blockedReason(MISSILE)}" }
+            return false
+        }
 
         val lock = target.rootVehicle
         val aim = if (guided) lock.boundingBox.center else target.position()
         val toTarget = aim.subtract(boss.getShootPos(MISSILE, 1f))
         val forwardOk = toTarget.lengthSqr() > 1.0 && toTarget.normalize().dot(boss.getViewVector(1f)) > 0.0
         val fired = shootNow(MISSILE, if (forwardOk) toTarget else null, if (guided) lock.uuid else null, aim)
-        if (fired) missileNextTick = now + scaled(between(40, 60))
+        if (fired) {
+            missileNextTick = now + scaled(between(40, 60))
+            boss.thought.event("fire.fireMissile") {
+                "AGM-65 launched at ${target.name.string} (${if (guided) "locked" else "unguided, last known spot"}), missiles left ${roundsText(MISSILE)}"
+            }
+        }
         return fired
     }
 
@@ -149,14 +164,25 @@ class FireControl(private val boss: A10WarthogBossEntity) {
      */
     fun fireRocket(aimPoint: Vec3): Boolean {
         val now = boss.tickCount
-        if (now < rocketNextTick || !canShoot(ROCKET)) return false
+        if (now < rocketNextTick) return false
+        if (!canShoot(ROCKET)) {
+            boss.thought.think("fire.fireRocket") { "holding fire: ${blockedReason(ROCKET)}" }
+            return false
+        }
 
         val toPoint = aimPoint.subtract(boss.getShootPos(ROCKET, 1f))
         if (toPoint.lengthSqr() < 1.0) return false
         if (toPoint.normalize().dot(boss.getViewVector(1f)) < MIN_ROCKET_FORWARD_DOT) return false
 
         val fired = shootNow(ROCKET, toPoint, null, null)
-        if (fired) rocketNextTick = now + rateInterval(ROCKET)
+        if (fired) {
+            rocketNextTick = now + rateInterval(ROCKET)
+            // One line per salvo, not per rocket.
+            if (now - lastRocketShot > ROCKET_SALVO_GAP) {
+                boss.thought.event("fire.fireRocket") { "rocket salvo started, rockets left ${roundsText(ROCKET)}" }
+            }
+            lastRocketShot = now
+        }
         return fired
     }
 
@@ -164,7 +190,10 @@ class FireControl(private val boss: A10WarthogBossEntity) {
     fun releaseFlare() {
         if (boss.isWreck || boss.crippled) return
         if (boss.decoyCount < 1) {
-            if (BossConfig.LIMITED_AMMO.get()) return
+            if (BossConfig.LIMITED_AMMO.get()) {
+                boss.thought.think("fire.releaseFlare") { "flares empty, none released" }
+                return
+            }
             boss.decoyCount = boss.computed().decoyMagazineSize
         }
         boss.decoyInputDown = true
@@ -267,13 +296,19 @@ class FireControl(private val boss: A10WarthogBossEntity) {
      */
     fun dropBomb(): Boolean {
         selectBombVariant(false)
-        if (!pilotSeated() || !canShoot(BOMB)) return false
+        if (!pilotSeated() || !canShoot(BOMB)) {
+            boss.thought.think("fire.dropBomb") { "holding bombs: ${if (!pilotSeated()) "no pilot seated" else blockedReason(BOMB)}" }
+            return false
+        }
         return shootNow(BOMB, null, null, null)
     }
 
     /** Releases one selected Mk 84 bomb. The brain selects the variant before solving the release point. */
     fun dropNuke(): Boolean {
-        if (!pilotSeated() || ammoLeft(NUKE) <= 0) return false
+        if (!pilotSeated() || ammoLeft(NUKE) <= 0) {
+            boss.thought.think("fire.dropNuke") { "holding the Mk 84: ${if (!pilotSeated()) "no pilot seated" else "none left"}" }
+            return false
+        }
         return shootNow(BOMB, null, null, null, NUKE, nuke = true)
     }
 
@@ -300,7 +335,7 @@ class FireControl(private val boss: A10WarthogBossEntity) {
 
     /**
      * Per-tick displacement of [entity] (reliable on the server, unlike `deltaMovement` for players). Zero for the ghost
-     * of a hidden target: `TargetSight` keeps its previous position equal to its position.
+     * of a hidden target: `LastKnownLocation` keeps its previous position equal to its position.
      */
     fun velocityOf(entity: Entity): Vec3 {
         val v = Vec3(entity.x - entity.xo, entity.y - entity.yo, entity.z - entity.zo)
@@ -317,6 +352,24 @@ class FireControl(private val boss: A10WarthogBossEntity) {
 
     // ------------------------------------------------------------------------------------------------ ammunition
 
+    /** Why [canShoot] says no for [weapon], for the console. */
+    private fun blockedReason(weapon: String): String = when {
+        boss.isWreck || boss.crippled -> "boss is down"
+        ammoLeft(weapon) <= 0 -> "out of ${weapon.lowercase()} ammo"
+        boss.getGunData(weapon) == null -> "no $weapon fitted"
+        else -> "$weapon reloading or cooling"
+    }
+
+    private fun roundsText(weapon: String): String = ammoLeft(weapon).let { if (it == Int.MAX_VALUE) "unlimited" else "$it" }
+
+    /** One-line ammunition summary for the heartbeat: the finite loads and the flares. */
+    fun ammoSummary(): String {
+        val flares = boss.decoyCount
+        if (!BossConfig.LIMITED_AMMO.get()) return "unlimited, flares $flares"
+        return "cannon ${ammoLeft(CANNON)} rocket ${ammoLeft(ROCKET)} bomb ${ammoLeft(BOMB)} " +
+                "mk84 ${ammoLeft(NUKE)} agm ${ammoLeft(MISSILE)} flares $flares"
+    }
+
     /** Munitions left for [weapon]; effectively unlimited unless the config enables a finite load. */
     fun ammoLeft(weapon: String): Int {
         if (!BossConfig.LIMITED_AMMO.get()) return Int.MAX_VALUE
@@ -324,6 +377,15 @@ class FireControl(private val boss: A10WarthogBossEntity) {
     }
 
     fun hasAmmo(weapon: String): Boolean = ammoLeft(weapon) > 0
+
+    /**
+     * True when finite ammo is on and any weapon is below its full load or the flares are below the configured count:
+     * the boss has something to gain from rearming (see the idle resupply in the brain). Never true for unlimited ammo.
+     */
+    fun anySpent(): Boolean {
+        if (!BossConfig.LIMITED_AMMO.get()) return false
+        return ammo.any { (weapon, left) -> left < fullLoad(weapon) } || boss.decoyCount < BossConfig.FLARE_COUNT.get()
+    }
 
     private fun consumeAmmo(weapon: String) {
         if (!BossConfig.LIMITED_AMMO.get()) return
@@ -394,11 +456,10 @@ class FireControl(private val boss: A10WarthogBossEntity) {
         }
 
         val fired = shotDirection ?: run {
-            if (nuke && BossConfig.DEBUG_LOGGING.get()) {
-                SuperbEnemies.LOGGER.warn(
-                    "[A10 boss] Mk 84 release rejected: selected ammo {}, magazine {}, available ammo {}",
-                    gunData.selectedAmmoType.get(), gunData.ammo.get(), gunData.currentAvailableAmmo(boss.ammoSupplier)
-                )
+            if (nuke) {
+                boss.thought.event("fire.fireBomb") {
+                    "Mk 84 release rejected: selected ammo ${gunData.selectedAmmoType.get()}, magazine ${gunData.ammo.get()}, available ammo ${gunData.currentAvailableAmmo(boss.ammoSupplier)}"
+                }
             }
             return false
         }
@@ -437,6 +498,7 @@ class FireControl(private val boss: A10WarthogBossEntity) {
         private const val DEFAULT_BOMB_FALL_TICKS = 70.0
         private const val MAX_LEAD_TICKS = 120.0
         private const val BURST_GAP_RESET = 2
+        private const val ROCKET_SALVO_GAP = 30
         private const val HEAT_CAP = 70.0
         private const val MIN_ROCKET_FORWARD_DOT = 0.2
         private const val P3_THRESHOLD = 0.3f

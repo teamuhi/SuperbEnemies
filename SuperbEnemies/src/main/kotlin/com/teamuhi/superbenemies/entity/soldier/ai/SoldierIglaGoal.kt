@@ -6,7 +6,7 @@ import com.atsuishio.superbwarfare.init.ModSounds
 import com.atsuishio.superbwarfare.init.ModTags
 import com.atsuishio.superbwarfare.tools.SeekTool
 import com.teamuhi.superbenemies.config.SoldierConfig
-import com.teamuhi.superbenemies.entity.boss.common.BossAircraft
+import com.teamuhi.superbenemies.entity.boss.common.air.BossAircraft
 import com.teamuhi.superbenemies.entity.boss.common.ai.TrackedBosses
 import com.teamuhi.superbenemies.entity.boss.common.ai.TrackedProjectiles
 import com.teamuhi.superbenemies.entity.dummy.ai.DummyAi
@@ -17,18 +17,9 @@ import net.minecraft.util.Mth
 import net.minecraft.world.entity.Entity
 import net.minecraft.world.entity.ai.goal.Goal
 import net.minecraft.world.entity.projectile.Projectile
-import net.minecraft.world.level.ClipContext
 import net.minecraft.world.level.levelgen.Heightmap
-import net.minecraft.world.phys.HitResult
-import net.minecraft.world.phys.Vec3
 import java.util.EnumSet
 import kotlin.math.abs
-import kotlin.math.acos
-import kotlin.math.atan2
-import kotlin.math.cos
-import kotlin.math.hypot
-import kotlin.math.sin
-import kotlin.math.sqrt
 
 /**
  * The soldier's "smart ADS": it finds a boss aircraft it can lock like a player with an Igla would, aims down the
@@ -81,8 +72,7 @@ class SoldierIglaGoal(private val soldier: DummySoldierEntity) : Goal() {
     private var flaresNear = false
     private var staggered = false
 
-    private var wobbleYaw = 0f
-    private var wobblePitch = 0f
+    private val aiming = SoldierAiming(soldier)
 
     /** The idle scan skipped a boss because the shared raycast budget was spent (see [DummyAi.sightRays]). */
     private var rayDeferred = false
@@ -94,32 +84,64 @@ class SoldierIglaGoal(private val soldier: DummySoldierEntity) : Goal() {
     override fun requiresUpdateEveryTick(): Boolean = true
 
     override fun canUse(): Boolean {
-        if (!soldier.isAlive || soldier.isPassenger || soldier.loaded <= 0 || soldier.activeMissile != null) return false
+        if (!soldier.isAlive || soldier.isPassenger || soldier.ammo.loaded <= 0 || soldier.activeMissile != null) {
+            soldier.thought.think("igla.canUse") {
+                "no: " + when {
+                    !soldier.isAlive -> "dead"
+                    soldier.isPassenger -> "riding something"
+                    soldier.ammo.loaded <= 0 -> "launcher empty"
+                    else -> "a missile is still flying"
+                }
+            }
+            return false
+        }
         val now = soldier.tickCount
         if (now < nextScanTick) return false
         nextScanTick = now + SCAN_INTERVAL
-        if (soldier.wantsCover()) return false
+        if (soldier.wantsCover()) {
+            soldier.thought.think("igla.canUse") { "no: wants cover" }
+            return false
+        }
         rayDeferred = false
         candidate = scan()
         // Other soldiers used this tick's raycasts: look again next tick instead of waiting a full scan interval.
         if (candidate == null && rayDeferred) nextScanTick = now + 1
+        soldier.thought.think("igla.canUse") {
+            val found = candidate
+            if (found != null) "yes: ${found.name.string} is lockable" else "no: no lockable boss aircraft"
+        }
         return candidate != null
     }
 
     override fun canContinueToUse(): Boolean {
-        if (aborted || !soldier.isAlive || soldier.isPassenger) return false
-        val boss = target ?: return false
-        if (!usable(boss)) return false
+        val reason = continuesReason()
+        if (reason != null) soldier.thought.think("igla.canContinueToUse") { "no: $reason" }
+        return reason == null
+    }
+
+    /** Why the engagement cannot go on, or null when it can. */
+    private fun continuesReason(): String? {
+        if (aborted) return "engagement aborted"
+        if (!soldier.isAlive || soldier.isPassenger) return "soldier unable to fight"
+        val boss = target ?: return "no target"
+        if (!usable(boss)) return "target no longer usable"
         if (phase == Phase.GUIDE) {
             // The missile can drop the lock by itself (overshoot: SBW sets its target to "none"): stop aiming at once.
             val missile = soldier.activeMissile
-            return missile != null && !missile.isRemoved && !missile.isLost() &&
-                missile.getTargetUUID() == boss.stringUUID && phaseTicks < GUIDE_TIMEOUT
+            return when {
+                missile == null || missile.isRemoved -> "missile is gone"
+                missile.isLost() || missile.getTargetUUID() != boss.stringUUID -> "missile lost its lock"
+                phaseTicks >= GUIDE_TIMEOUT -> "guidance timed out"
+                else -> null
+            }
         }
-        return soldier.loaded > 0 && !soldier.wantsCover()
+        if (soldier.ammo.loaded <= 0) return "launcher empty"
+        if (soldier.wantsCover()) return "wants cover"
+        return null
     }
 
     override fun start() {
+        soldier.thought.event("igla.start") { "engaging ${candidate?.name?.string}" }
         target = candidate
         candidate = null
         aborted = false
@@ -131,8 +153,7 @@ class SoldierIglaGoal(private val soldier: DummySoldierEntity) : Goal() {
         lockable = true
         flaresNear = false
         staggered = false
-        wobbleYaw = 0f
-        wobblePitch = 0f
+        aiming.reset()
         nextCheckTick = 0
         soldier.navigation.stop()
         if (SoldierConfig.REACTION_TICKS.get() > 0) {
@@ -144,6 +165,7 @@ class SoldierIglaGoal(private val soldier: DummySoldierEntity) : Goal() {
     }
 
     override fun stop() {
+        soldier.thought.event("igla.stop") { "engagement over (phase $phase), launcher lowered" }
         // Lowering the launcher is what ends the missile's guidance: the soldier's watchdog sets a flying missile lost.
         soldier.aim(false)
         target = null
@@ -152,37 +174,44 @@ class SoldierIglaGoal(private val soldier: DummySoldierEntity) : Goal() {
     }
 
     override fun tick() {
-        val boss = target ?: return abort()
+        val boss = target ?: return abort("no target")
         val now = soldier.tickCount
         phaseTicks++
         engagedTicks++
-        hold()
+        aiming.hold()
 
         when (phase) {
             Phase.REACT -> {
+                soldier.thought.think("igla.tick") { "reacting to ${boss.name.string}" }
                 turnTo(boss)
                 if (phaseTicks >= SoldierConfig.REACTION_TICKS.get()) enterRaise()
             }
             Phase.RAISE -> {
+                soldier.thought.think("igla.tick") { "raising the launcher towards ${boss.name.string}" }
                 turnTo(boss)
                 if (phaseTicks >= RAISE_TICKS) enterSeek()
             }
             Phase.SEEK -> tickSeek(boss, now)
             Phase.LOCKED -> tickLocked(boss, now)
-            Phase.GUIDE -> turnTo(boss)
+            Phase.GUIDE -> {
+                soldier.thought.think("igla.tick") { "guiding the missile onto ${boss.name.string}" }
+                turnTo(boss)
+            }
         }
-        if (phase != Phase.GUIDE && engagedTicks > ENGAGE_TIMEOUT) abort()
+        if (phase != Phase.GUIDE && engagedTicks > ENGAGE_TIMEOUT) abort("engagement timed out")
     }
 
     // ================================================================================================== phases
 
     private fun enterRaise() {
+        soldier.thought.event("igla.phase") { "$phase -> RAISE" }
         phase = Phase.RAISE
         phaseTicks = 0
         soldier.aim(true)
     }
 
     private fun enterSeek() {
+        soldier.thought.event("igla.phase") { "$phase -> SEEK" }
         phase = Phase.SEEK
         phaseTicks = 0
         seekTicks = 0
@@ -190,6 +219,7 @@ class SoldierIglaGoal(private val soldier: DummySoldierEntity) : Goal() {
     }
 
     private fun enterLocked() {
+        soldier.thought.event("igla.phase") { "$phase -> LOCKED" }
         phase = Phase.LOCKED
         phaseTicks = 0
         flareHold = 0
@@ -201,9 +231,14 @@ class SoldierIglaGoal(private val soldier: DummySoldierEntity) : Goal() {
     private fun tickSeek(boss: Entity, now: Int) {
         turnTo(boss)
         refreshChecks(boss, now)
-        if (sightLostTicks > SIGHT_LOST_ABORT) return abort()
+        if (sightLostTicks > SIGHT_LOST_ABORT) return abort("lost sight of ${boss.name.string}")
 
-        if (lockable && angleTo(boss) <= LOCK_CONE) seekTicks++ else seekTicks = 0
+        val inCone = lockable && angleTo(boss) <= LOCK_CONE
+        if (inCone) seekTicks++ else seekTicks = 0
+        soldier.thought.think("igla.tickSeek") {
+            if (inCone) "locking on ${boss.name.string}"
+            else "searching for a lock on ${boss.name.string}: ${if (!lockable) "no clear line, range, height or smoke" else "launcher off target"}"
+        }
         if (seekTicks == LOCKING_SOUND_TICK) play(ModSounds.MISSILE_LOCKING.get())
         if (seekTicks > SoldierConfig.LOCK_TIME_TICKS.get()) enterLocked()
     }
@@ -211,30 +246,35 @@ class SoldierIglaGoal(private val soldier: DummySoldierEntity) : Goal() {
     private fun tickLocked(boss: Entity, now: Int) {
         turnTo(boss)
         refreshChecks(boss, now)
-        if (sightLostTicks > SIGHT_LOST_ABORT) return abort()
+        if (sightLostTicks > SIGHT_LOST_ABORT) return abort("lost sight of ${boss.name.string}")
 
         // The lock is gone: back to seeking, which restarts the count.
         if (!lockable || angleTo(boss) > LOCK_CONE) {
+            soldier.thought.event("igla.tickLocked") { "lock on ${boss.name.string} lost, seeking again" }
             enterSeek()
             return
         }
         if (flaresNear && flareHold < FLARE_HOLD_MAX) {
             flareHold++
+            soldier.thought.think("igla.tickLocked") { "holding fire: decoys near ${boss.name.string}" }
             return
         }
         if (staggered && staggerHold < STAGGER_HOLD_MAX) {
             staggerHold++
+            soldier.thought.think("igla.tickLocked") { "holding fire: another soldier's missile is already homing on ${boss.name.string}" }
             return
         }
+        soldier.thought.event("igla.tickLocked") { "locked on ${boss.name.string}, launching the missile" }
         if (soldier.launchMissile(boss)) {
             phase = Phase.GUIDE
             phaseTicks = 0
         } else {
-            abort()
+            abort("launch failed")
         }
     }
 
-    private fun abort() {
+    private fun abort(why: String) {
+        soldier.thought.event("igla.abort") { "engagement aborted: $why" }
         aborted = true
         nextScanTick = soldier.tickCount + RETRY_AFTER_ABORT
     }
@@ -293,10 +333,10 @@ class SoldierIglaGoal(private val soldier: DummySoldierEntity) : Goal() {
         return best
     }
 
-    /** Alive, in the same level, not crippled and not a wreck. */
+    /** A boss aircraft (the Igla ignores ground bosses), alive, in the same level, not crippled and not a wreck. */
     private fun usable(boss: Entity): Boolean {
+        if (boss !is BossAircraft || boss.crippled) return false
         if (boss.isRemoved || !boss.isAlive || boss.level() !== soldier.level()) return false
-        if ((boss as? BossAircraft)?.crippled == true) return false
         return (boss as? VehicleEntity)?.isWreck != true
     }
 
@@ -311,7 +351,7 @@ class SoldierIglaGoal(private val soldier: DummySoldierEntity) : Goal() {
             rayDeferred = true
             return false
         }
-        return clearLine(boss) && SeekTool.NOT_IN_SMOKE.test(boss)
+        return aiming.clearLine(soldier.eyePosition, aiming.centreOf(boss)) && SeekTool.NOT_IN_SMOKE.test(boss)
     }
 
     /** The Igla's `MinTargetHeight`: the boss is at least [MIN_TARGET_HEIGHT] blocks above the top blocking block under it. */
@@ -323,71 +363,12 @@ class SoldierIglaGoal(private val soldier: DummySoldierEntity) : Goal() {
         return boss.y - ground >= MIN_TARGET_HEIGHT
     }
 
-    /** SBW's client `noClip` rule (collider clip, fluids ignored), from the soldier's eyes to the boss's hitbox centre. */
-    private fun clearLine(boss: Entity): Boolean {
-        val from = soldier.eyePosition
-        val to = Vec3(boss.x, boss.y + boss.bbHeight * 0.5, boss.z)
-        return soldier.level().clip(ClipContext(from, to, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, soldier)).type != HitResult.Type.BLOCK
-    }
-
     // ================================================================================================== aiming
 
-    /** Stands still: no path, no strafing, no sprinting, no crouching. */
-    private fun hold() {
-        soldier.navigation.stop()
-        soldier.strafeAt(0f, 0f, 0f) // clears the move control, so a path that was cancelled does not keep walking
-        soldier.isSprinting = false
-        soldier.setCrouched(false)
-    }
+    private fun angleTo(boss: Entity): Double = aiming.angleTo(boss)
 
-    /** Angle in degrees between the launcher's direction and the direction from the eyes to the boss's centre. */
-    private fun angleTo(boss: Entity): Double {
-        val dx = boss.x - soldier.x
-        val dy = boss.y + boss.bbHeight * 0.5 - soldier.eyeY
-        val dz = boss.z - soldier.z
-        val length = sqrt(dx * dx + dy * dy + dz * dz)
-        if (length < 1.0e-6) return 0.0
-        val yaw = soldier.yRot * DEG_TO_RAD
-        val pitch = soldier.xRot * DEG_TO_RAD
-        val dot = (-sin(yaw) * cos(pitch) * dx - sin(pitch) * dy + cos(yaw) * cos(pitch) * dz) / length
-        return Math.toDegrees(acos(dot.coerceIn(-1.0, 1.0)))
-    }
-
-    /**
-     * Swings body, head and pitch toward the boss's centre at `aimTurnSpeed` degrees per tick, plus a small smoothed
-     * random wobble so the aim is not machine-perfect. Rotations are written directly (vanilla's look control only moves
-     * the head); the look control is also pointed along the new direction every tick, because it resets the pitch
-     * of a mob that is not looking at anything.
-     */
-    private fun turnTo(boss: Entity) {
-        val dx = boss.x - soldier.x
-        val dz = boss.z - soldier.z
-        val dy = boss.y + boss.bbHeight * 0.5 - soldier.eyeY
-        val horizontal = hypot(dx, dz)
-        val rng = soldier.getRandom()
-        wobbleYaw = wobbleYaw * WOBBLE_KEEP + (rng.nextFloat() * 2f - 1f) * WOBBLE_DEG * (1f - WOBBLE_KEEP)
-        wobblePitch = wobblePitch * WOBBLE_KEEP + (rng.nextFloat() * 2f - 1f) * WOBBLE_DEG * (1f - WOBBLE_KEEP)
-
-        val speed = SoldierConfig.AIM_TURN_SPEED.get().toFloat()
-        val wantedYaw =
-            if (horizontal > 1.0e-3) (atan2(dz, dx) * RAD_TO_DEG).toFloat() - 90f + wobbleYaw else soldier.yRot
-        val wantedPitch = (-(atan2(dy, horizontal) * RAD_TO_DEG)).toFloat().plus(wobblePitch).coerceIn(-MAX_PITCH, MAX_PITCH)
-        val yaw = Mth.approachDegrees(soldier.yRot, wantedYaw, speed)
-        val pitch = Mth.approachDegrees(soldier.xRot, wantedPitch, speed)
-        soldier.yRot = yaw
-        soldier.yBodyRot = yaw
-        soldier.yHeadRot = yaw
-        soldier.xRot = pitch
-
-        val yawRad = yaw * DEG_TO_RAD
-        val pitchRad = pitch * DEG_TO_RAD
-        soldier.lookControl.setLookAt(
-            soldier.x - sin(yawRad) * cos(pitchRad) * LOOK_DISTANCE,
-            soldier.eyeY - sin(pitchRad) * LOOK_DISTANCE,
-            soldier.z + cos(yawRad) * cos(pitchRad) * LOOK_DISTANCE,
-            LOOK_TURN_SPEED, LOOK_TURN_SPEED
-        )
-    }
+    /** Swings onto the boss at `aimTurnSpeed` degrees per tick (see [SoldierAiming.turnTo]). */
+    private fun turnTo(boss: Entity) = aiming.turnTo(boss, SoldierConfig.AIM_TURN_SPEED.get().toFloat())
 
     private fun play(sound: SoundEvent) {
         soldier.level().playSound(null, soldier.x, soldier.y, soldier.z, sound, SoundSource.PLAYERS, SOUND_VOLUME, 1f)
@@ -430,17 +411,7 @@ class SoldierIglaGoal(private val soldier: DummySoldierEntity) : Goal() {
         const val GUIDE_TIMEOUT = 340
 
         const val ANGLE_EPSILON = 1.0e-3
-        const val MAX_PITCH = 89f
-
-        /** Aim wobble: amplitude in degrees and how much of the previous value is kept each tick (smoothing). */
-        const val WOBBLE_DEG = 1.0f
-        const val WOBBLE_KEEP = 0.9f
-
-        const val LOOK_DISTANCE = 8.0
-        const val LOOK_TURN_SPEED = 90f
 
         const val SOUND_VOLUME = 2f
-        const val DEG_TO_RAD = 0.017453292519943295
-        const val RAD_TO_DEG = 57.29577951308232
     }
 }

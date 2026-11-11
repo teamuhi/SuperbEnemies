@@ -2,7 +2,7 @@ package com.teamuhi.superbenemies.entity.boss.common.ai
 
 import com.atsuishio.superbwarfare.entity.projectile.ITrackableProjectile
 import com.atsuishio.superbwarfare.entity.vehicle.base.VehicleEntity
-import com.teamuhi.superbenemies.entity.boss.common.BossAircraft
+import com.teamuhi.superbenemies.entity.boss.common.BossVehicle
 import net.minecraft.world.entity.Entity
 import net.minecraft.world.phys.Vec3
 import java.util.UUID
@@ -13,16 +13,20 @@ import java.util.UUID
  * A missile is a threat when it implements SBW's [ITrackableProjectile], its target UUID is the boss (or one of its crew),
  * it has not already been lured away by a flare (`isDistracted`), it is closing in, and its time to impact is below
  * the phase threshold (or it is within [PANIC_DISTANCE] blocks). The first time a missile qualifies the boss rolls
- * [BossAircraft.flareMissChance]: on a miss that missile is ignored for good ("the pilot did not notice").
+ * [BossVehicle.flareMissChance]: on a miss that missile is ignored for good ("the pilot did not notice").
  *
- * Reaction (flares only with [BossAircraft.defensiveFlares], off by default; the brain still breaks away): three flare bursts [FLARE_INTERVAL] ticks apart. Because a flare only distracts a missile that is within
+ * Reaction (flares only with [BossVehicle.defensiveFlares], off by default; the brain still breaks away): three flare bursts [FLARE_INTERVAL] ticks apart. Because a flare only distracts a missile that is within
  * 32 blocks and 60 degrees of its heading, a missile that is still undistracted inside [REINFORCE_DISTANCE] blocks gets
  * further single bursts (up to [MAX_EXTRA_BURSTS] per missile), so late flares still have a chance to seduce it.
  *
  * [tick] must run every boss tick, before `super.baseTick()`: SBW's `releaseDecoy` consumes `decoyInputDown` during
  * the vehicle tick. All state is per instance.
  */
-class ThreatMonitor<T>(private val boss: T) where T : VehicleEntity, T : BossAircraft {
+class ThreatMonitor<T>(
+    private val boss: T,
+    /** Decoy bursts released per new missile: the planes throw three flares, a tank one smoke salvo. */
+    private val bursts: Int = FLARE_BURSTS
+) where T : VehicleEntity, T : BossVehicle {
 
     /**
      * Horizontal unit direction from the boss to the missile that most recently triggered a reaction (valid after
@@ -30,6 +34,14 @@ class ThreatMonitor<T>(private val boss: T) where T : VehicleEntity, T : BossAir
      */
     var threatBearing: Vec3? = null
         private set
+
+    /**
+     * The missiles this boss has noticed and that are still on it: tracking the boss or its crew, closing in, not lured away
+     * and not written off by the miss roll. Refreshed by every scan (every [SCAN_INTERVAL] ticks), so a consumer must check
+     * that an entry is still alive. Read by the tank's missile shoot-down (see `ShootHomingMissiles`).
+     */
+    val inbound: List<Entity> get() = inboundMissiles
+    private val inboundMissiles = ArrayList<Entity>()
 
     /** Missile UUID -> tick of the first reaction, or [IGNORED]. */
     private val handled = HashMap<UUID, Int>()
@@ -49,6 +61,7 @@ class ThreatMonitor<T>(private val boss: T) where T : VehicleEntity, T : BossAir
         if (boss.crippled || boss.isWreck) {
             flaresLeft = 0
             flareInputPending = false
+            inboundMissiles.clear()
             return false
         }
         driveFlares(now)
@@ -70,6 +83,7 @@ class ThreatMonitor<T>(private val boss: T) where T : VehicleEntity, T : BossAir
         val position = boss.position()
         // Event-driven list of guided projectiles: empty (and free) unless somebody has fired a missile.
         val candidates = TrackedProjectiles.near(boss.level(), position, SCAN_RADIUS)
+        inboundMissiles.clear()
         if (candidates.isEmpty()) {
             if (handled.isNotEmpty()) handled.clear()
             if (extraBursts.isNotEmpty()) extraBursts.clear()
@@ -105,6 +119,7 @@ class ThreatMonitor<T>(private val boss: T) where T : VehicleEntity, T : BossAir
             val timeToImpact = distance / closing
 
             if (last != null) {
+                inboundMissiles.add(entity)
                 reinforce(entity.uuid, distance)
                 continue
             }
@@ -114,11 +129,18 @@ class ThreatMonitor<T>(private val boss: T) where T : VehicleEntity, T : BossAir
             // First time this missile qualifies: the pilot may simply not notice it.
             if (chance > 0.0 && boss.getRandom().nextDouble() < chance) {
                 handled[entity.uuid] = IGNORED
+                boss.thought.event("threats.scan") {
+                    "missile not noticed (${"%.1f".format(timeToImpact / 20.0)}s out, ${distance.toInt()} blocks): ignored"
+                }
                 continue
             }
 
             handled[entity.uuid] = now
+            inboundMissiles.add(entity)
             newThreat = true
+            boss.thought.event("threats.scan") {
+                "missile detected: impact in ${"%.1f".format(timeToImpact / 20.0)}s, ${distance.toInt()} blocks away"
+            }
             if (timeToImpact < bestTime) {
                 bestTime = timeToImpact
                 bestBearing = bearingTo(entity, position)
@@ -132,8 +154,11 @@ class ThreatMonitor<T>(private val boss: T) where T : VehicleEntity, T : BossAir
         if (newThreat) {
             threatBearing = bestBearing ?: threatBearing
             if (boss.defensiveFlares()) {
-                flaresLeft = FLARE_BURSTS
+                flaresLeft = bursts
                 nextFlareTick = now
+                boss.thought.event("threats.scan") { "decoy response: $bursts bursts queued" }
+            } else {
+                boss.thought.event("threats.scan") { "no decoys (defensive flares off), breaking away only" }
             }
         }
         return newThreat
@@ -147,17 +172,22 @@ class ThreatMonitor<T>(private val boss: T) where T : VehicleEntity, T : BossAir
         extraBursts[id] = used + 1
         flaresLeft = 1
         nextFlareTick = boss.tickCount
+        boss.thought.event("threats.reinforce") { "missile still on us ${distance.toInt()} blocks out: late decoy burst ${used + 1}/$MAX_EXTRA_BURSTS" }
     }
 
     /** Releases one flare burst per [FLARE_INTERVAL] ticks while a response is pending. */
     private fun driveFlares(now: Int) {
         if (flaresLeft <= 0 || now < nextFlareTick) return
         if (boss.decoyCount < 1) {
-            if (boss.limitedAmmo()) return
+            if (boss.limitedAmmo()) {
+                boss.thought.think("threats.driveFlares") { "decoys empty, none released" }
+                return
+            }
             boss.decoyCount = boss.computed().decoyMagazineSize
         }
         flareInputPending = true
         flaresLeft--
+        boss.thought.event("threats.driveFlares") { "decoy burst released, $flaresLeft left in this response" }
         nextFlareTick = now + FLARE_INTERVAL
     }
 

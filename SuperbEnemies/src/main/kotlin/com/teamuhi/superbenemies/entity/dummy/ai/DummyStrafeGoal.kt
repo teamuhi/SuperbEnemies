@@ -43,18 +43,25 @@ class DummyStrafeGoal(private val dummy: HumanoidDummyEntity) : Goal() {
 
     override fun canUse(): Boolean {
         if (dummy.isPassenger || !dummy.isAlive) return false
-        return strafing() || driftedFromAnchor()
+        val strafe = strafing()
+        val drifted = !strafe && driftedFromAnchor()
+        dummy.thought.think("strafe.canUse") {
+            if (strafe) "yes: strafing" else if (drifted) "yes: pushed away from the anchor, walking back" else "no: not strafing, at the anchor"
+        }
+        return strafe || drifted
     }
 
     override fun canContinueToUse(): Boolean = canUse()
 
     override fun start() {
+        dummy.thought.event("strafe.start") { "strafe goal started (${dummy.settings.movement()})" }
         moveTicks = 0
         sprintTicks = 0
         crouchTicks = 0
     }
 
     override fun stop() {
+        dummy.thought.event("strafe.stop") { "strafe goal over" }
         dummy.navigation.stop()
         dummy.isSprinting = false
         dummy.setCrouched(false)
@@ -81,6 +88,7 @@ class DummyStrafeGoal(private val dummy: HumanoidDummyEntity) : Goal() {
         } else if (config.crouching() && sprintTicks == 0 && rng.nextInt(CROUCH_CHANCE) == 0) {
             crouchTicks = CROUCH_MIN_TICKS + rng.nextInt(CROUCH_EXTRA_TICKS)
             dummy.setCrouched(true)
+            dummy.thought.event("strafe.crouch") { "crouching for $crouchTicks ticks" }
         }
 
         // --- sprint burst: a random direction, vanilla's +30% comes with the sprint flag ---
@@ -94,6 +102,7 @@ class DummyStrafeGoal(private val dummy: HumanoidDummyEntity) : Goal() {
             sprintForward = cos(angle)
             sprintLeft = sin(angle)
             dummy.isSprinting = true
+            dummy.thought.event("strafe.sprint") { "sprint burst for $sprintTicks ticks" }
         }
 
         // --- jump ---
@@ -111,6 +120,17 @@ class DummyStrafeGoal(private val dummy: HumanoidDummyEntity) : Goal() {
             inputLeft = DummyAi.localLeft(dummy.yRot, home.first, home.second)
         }
 
+        dummy.thought.think("strafe.move") {
+            val how = when {
+                home != null -> "heading back towards the anchor (outside the strafe radius)"
+                sprintTicks > 0 -> "sprint burst"
+                forward > 0f -> "stepping forward"
+                forward < 0f -> "stepping back"
+                left > 0f -> "strafing left"
+                else -> "strafing right"
+            }
+            if (crouchTicks > 0) "$how, crouched" else how
+        }
         dummy.strafeAt(inputForward, inputLeft, if (crouchTicks > 0) CROUCH_SPEED else 1f)
     }
 
@@ -161,6 +181,9 @@ class DummyStrafeGoal(private val dummy: HumanoidDummyEntity) : Goal() {
         if (!DummyAi.pathfinds.tryTake(dummy.level())) return
         if (!dummy.navigation.moveTo(centre.x, centre.y, centre.z, 1.0)) {
             giveUpUntil = dummy.tickCount + GIVE_UP_TICKS
+            dummy.thought.event("strafe.walkBack") { "no path back to the anchor, giving up for $GIVE_UP_TICKS ticks" }
+        } else {
+            dummy.thought.think("strafe.walkBack") { "STATIC mode: walking back to the anchor" }
         }
     }
 

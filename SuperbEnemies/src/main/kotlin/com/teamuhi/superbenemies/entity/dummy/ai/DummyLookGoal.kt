@@ -11,16 +11,17 @@ import kotlin.math.hypot
 import kotlin.math.sin
 
 /**
- * Turns the dummy to face the nearest threat the way a player would: the nearest boss within
- * [DummyAi.BOSS_RANGE] blocks, otherwise the nearest player within [PLAYER_RANGE]. Runs in every movement mode, so a
+ * Turns the dummy to face the nearest threat the way a player would: [HumanoidDummyEntity.lookThreat] (by default the
+ * nearest boss within [DummyAi.BOSS_RANGE] blocks), otherwise the nearest player within [PLAYER_RANGE]. Runs in every movement mode, so a
  * STATIC dummy still follows the action.
  *
  * Body, head and pitch are turned directly (vanilla's look control only moves the head and adds an offset). While the
- * dummy is following a path (running to cover) only the head and pitch turn, so it faces where it is running.
- * The threat is re-picked every [SCAN_INTERVAL] ticks; aiming happens every tick.
+ * dummy is following a path, whatever the reason (running to cover, walking home, roaming) it faces where it is running
+ * instead: the head traces the path (see [traceWalkingPath]) and the move control turns the body. The threat is picked up
+ * again as soon as it stands still. The threat is re-picked every [SCAN_INTERVAL] ticks; aiming happens every tick.
  *
- * In ROAM mode ([HumanoidDummyEntity.roaming]) the head instead traces the walking path (see [traceWalkingPath]) and,
- * standing with no threat, glances around; with a threat it still faces it while standing.
+ * In ROAM mode ([HumanoidDummyEntity.roaming]) the dummy also glances around while standing with no threat; with a
+ * threat it faces it while standing.
  */
 class DummyLookGoal(private val dummy: HumanoidDummyEntity) : Goal() {
 
@@ -41,24 +42,42 @@ class DummyLookGoal(private val dummy: HumanoidDummyEntity) : Goal() {
     override fun canUse(): Boolean {
         if (dummy.isPassenger || !dummy.isAlive) return false
         rescanIfDue()
-        return threat != null || dummy.roaming
+        val can = threat != null || dummy.roaming || dummy.navigation.isInProgress
+        dummy.thought.think("look.canUse") {
+            if (threat != null) "yes: watching ${threat?.name?.string}"
+            else if (dummy.roaming) "yes: roaming, glancing around"
+            else if (dummy.navigation.isInProgress) "yes: following its path"
+            else "no: nothing to look at"
+        }
+        return can
     }
 
     override fun canContinueToUse(): Boolean = canUse()
 
     override fun stop() {
+        dummy.thought.event("look.stop") { "look goal over" }
         threat = null
         glanceUntil = 0
     }
 
     override fun tick() {
         rescanIfDue()
-        if (dummy.roaming && dummy.navigation.isInProgress && traceWalkingPath()) return
-        val target = threat
-        if (target == null) {
-            if (dummy.roaming) glanceAround()
+        // Running anywhere (to cover, back home, roaming): face where the path leads. Near the last node the head just
+        // keeps its heading instead of swinging round to the threat a moment before arriving.
+        if (dummy.navigation.isInProgress) {
+            dummy.thought.think("look.tick") { "looking along its walking path" }
+            traceWalkingPath()
             return
         }
+        val target = threat
+        if (target == null) {
+            if (dummy.roaming) {
+                dummy.thought.think("look.tick") { "glancing around while roaming" }
+                glanceAround()
+            }
+            return
+        }
+        dummy.thought.think("look.tick") { "facing ${target.name.string}" }
 
         // Players are looked at in the face, a (large) aircraft at its centre.
         val aimY = if (target is Player) target.eyeY else target.y + target.bbHeight * 0.5
@@ -69,13 +88,9 @@ class DummyLookGoal(private val dummy: HumanoidDummyEntity) : Goal() {
         if (horizontal > 1.0e-3) {
             val wantedYaw = (Mth.atan2(dz, dx) * RAD_TO_DEG).toFloat() - 90f
             val yaw = Mth.approachDegrees(dummy.yRot, wantedYaw, MAX_TURN_PER_TICK)
-            if (dummy.navigation.isInProgress) {
-                dummy.yHeadRot = Mth.approachDegrees(dummy.yHeadRot, wantedYaw, MAX_TURN_PER_TICK)
-            } else {
-                dummy.yRot = yaw
-                dummy.yBodyRot = yaw
-                dummy.yHeadRot = yaw
-            }
+            dummy.yRot = yaw
+            dummy.yBodyRot = yaw
+            dummy.yHeadRot = yaw
         }
         val wantedPitch = (-(Mth.atan2(aimY - dummy.eyeY, horizontal) * RAD_TO_DEG)).toFloat().coerceIn(-dummy.maxLookPitch, dummy.maxLookPitch)
         dummy.xRot = Mth.approachDegrees(dummy.xRot, wantedPitch, MAX_TURN_PER_TICK)
@@ -121,8 +136,12 @@ class DummyLookGoal(private val dummy: HumanoidDummyEntity) : Goal() {
             return
         }
         nextScanTick = now + SCAN_INTERVAL
-        threat = DummyAi.nearestBoss(dummy, includeCrippled = true)
+        val previous = threat
+        threat = dummy.lookThreat()
             ?: dummy.level().getNearestPlayer(dummy, PLAYER_RANGE)
+        if (threat !== previous) {
+            dummy.thought.event("look.rescan") { "look target ${previous?.name?.string ?: "none"} -> ${threat?.name?.string ?: "none"}" }
+        }
     }
 
     private companion object {

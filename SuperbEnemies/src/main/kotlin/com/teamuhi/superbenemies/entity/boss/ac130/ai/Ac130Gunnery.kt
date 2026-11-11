@@ -4,7 +4,7 @@ import com.teamuhi.superbenemies.config.Ac130Config
 import com.teamuhi.superbenemies.entity.boss.ac130.Ac130BossEntity
 import com.teamuhi.superbenemies.entity.boss.ac130.Ac130Gun
 import com.teamuhi.superbenemies.entity.boss.common.BossCrewEntity
-import com.teamuhi.superbenemies.entity.boss.common.ai.FlightMath
+import com.teamuhi.superbenemies.entity.boss.common.air.FlightMath
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.util.Mth
 import net.minecraft.world.entity.Entity
@@ -73,6 +73,10 @@ class Ac130Gunnery(private val boss: Ac130BossEntity) {
 
     private val states = EnumMap<Ac130Gun, GunState>(Ac130Gun::class.java)
 
+    /** Console channel per gun, built once so the per-tick calls do not allocate. */
+    private val fireChannels = Ac130Gun.entries.associateWith { "gunnery.fire.${it.name}" }
+    private val ammoChannels = Ac130Gun.entries.associateWith { "gunnery.ammo.${it.name}" }
+
     /** Rounds left per weapon while `LIMITED_AMMO` is on. A missing entry means a full load. Keyed by weapon name. */
     private val ammo = HashMap<String, Int>()
 
@@ -112,6 +116,22 @@ class Ac130Gunnery(private val boss: Ac130BossEntity) {
     }
 
     fun hasAmmo(gun: Ac130Gun): Boolean = ammoLeft(gun) > 0
+
+    /** One-line ammunition summary for the heartbeat: rounds left per gun and the flares. */
+    fun ammoSummary(): String {
+        val flares = boss.decoyCount
+        if (!Ac130Config.LIMITED_AMMO.get()) return "unlimited, flares $flares"
+        return Ac130Gun.entries.joinToString(" ") { "${it.name.lowercase()} ${ammoLeft(it)}" } + " flares $flares"
+    }
+
+    /**
+     * True when finite ammo is on and any gun is below its full load or the flares are below the configured count:
+     * rearming would gain something (see the idle resupply in the brain). Never true for unlimited ammo.
+     */
+    fun anySpent(): Boolean {
+        if (!Ac130Config.LIMITED_AMMO.get()) return false
+        return Ac130Gun.entries.any { ammoLeft(it) < fullLoad(it) } || boss.decoyCount < Ac130Config.FLARE_COUNT.get()
+    }
 
     /** True when at least one enabled gun can still fire (always true without `limitedAmmo`, if any gun is enabled). */
     fun hasUsableGun(): Boolean = Ac130Gun.entries.any { enabled(it) && hasAmmo(it) }
@@ -181,6 +201,7 @@ class Ac130Gunnery(private val boss: Ac130BossEntity) {
             val st = stateOf(gun)
             val gunner = seatedGunner(gun)
             if (gunner == null) {
+                boss.thought.think(fireChannels.getValue(gun)) { "no gunner seated" }
                 st.hasAim = false
                 st.frameValid = false
                 st.burstEnd = 0
@@ -193,7 +214,15 @@ class Ac130Gunnery(private val boss: Ac130BossEntity) {
 
             val usable = live && resolved != null && enabled(gun) && hasAmmo(gun)
             st.hasAim = false
+            var hold = when {
+                !live -> "boss is down"
+                resolved == null -> "no aim point"
+                !enabled(gun) -> "disabled in the config"
+                else -> "out of ammo"
+            }
             if (usable) {
+                hold = "no valid aim vector"
+
                 val origin = boss.getShootPos(gunner, 1f)
                 var point = leadPoint(gun, origin, resolved!!.center, resolved.velocity)
                 if (gun == Ac130Gun.M61) point = point.add(scatter.scale(scatterScale))
@@ -205,14 +234,22 @@ class Ac130Gunnery(private val boss: Ac130BossEntity) {
                     st.wantPitch = FlightMath.pitch(wanted)
                     st.errorDeg = Double.MAX_VALUE
                     applyGun(gun, gunner, st)
-                    if (gun in allowed && wanted.length() <= MAX_RANGE &&
+                    val inRange = wanted.length() <= MAX_RANGE
+                    if (gun in allowed && inRange &&
                         (st.errorDeg <= FIRE_ANGLE || landsNear(gun, origin, point, st))
                     ) {
                         tryFire(gun, gunner, st, now, onLongBurstStart)
                         continue
                     }
+                    hold = when {
+                        !mayFire -> "this state does not allow firing"
+                        gun !in allowed -> "waiting for its turn"
+                        !inRange -> "target out of range"
+                        else -> "target outside the gun arc"
+                    }
                 }
             }
+            boss.thought.think(fireChannels.getValue(gun)) { "holding fire: $hold" }
             if (!st.hasAim) applyGun(gun, gunner, st)
             // Aim lost or not allowed to fire: the next time the gun lines up it starts a fresh burst.
             if (now - st.lastCall > BURST_GAP_RESET) st.burstEnd = 0
@@ -256,6 +293,9 @@ class Ac130Gunnery(private val boss: Ac130BossEntity) {
                 ClipContext(origin, point, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, boss)
             ).type == net.minecraft.world.phys.HitResult.Type.BLOCK
         ) AP_AMMO_TYPE else STANDARD_AMMO_TYPE
+        boss.thought.think(ammoChannels.getValue(gun)) {
+            if (ammoType == AP_AMMO_TYPE) "armour-piercing rounds: block in the way" else "standard rounds: clear shot"
+        }
         boss.getGunData(gun.seat)?.changeAmmoConsumer(ammoType, boss)
     }
 
@@ -299,6 +339,9 @@ class Ac130Gunnery(private val boss: Ac130BossEntity) {
             if (group.isNotEmpty()) add(group)
             for (gun in ready) if (!simultaneous(gun)) add(setOf(gun))
         }
+        boss.thought.think("gunnery.allowedGuns") {
+            if (turns.size <= 1) "ready guns fire together" else "guns take turns"
+        }
         if (turns.size <= 1) {
             turnKey = turns
             return turns.firstOrNull() ?: emptySet()
@@ -307,6 +350,7 @@ class Ac130Gunnery(private val boss: Ac130BossEntity) {
         if (turns != turnKey) {
             turnKey = turns
             startTurn(0, now)
+            boss.thought.event("gunnery.allowedGuns") { "gun line-up changed: ${turns.size} turn groups, starting over" }
         }
         val current = turns[turnIndex % turns.size]
         val lastActivity = max(turnStart, turnLastShot)
@@ -462,6 +506,7 @@ class Ac130Gunnery(private val boss: Ac130BossEntity) {
         onLongBurstStart: () -> Unit
     ) {
         if (boss.getGunData(gun.seat)?.canShoot(boss.ammoSupplier) != true) {
+            boss.thought.think(fireChannels.getValue(gun)) { "holding fire: reloading or overheated" }
             // Reloading / overheated: wait it out. A short back-off keeps a burst from restarting mid-reload.
             if (gun == Ac130Gun.M61) {
                 st.burstEnd = 0
@@ -469,6 +514,7 @@ class Ac130Gunnery(private val boss: Ac130BossEntity) {
             }
             return
         }
+        boss.thought.think(fireChannels.getValue(gun)) { "firing" }
         when (gun) {
             Ac130Gun.M61 -> fireCannon(gun, gunner, st, now, onLongBurstStart)
             Ac130Gun.BOFORS -> if (now >= st.nextShot) shoot(gun, gunner, st, now, rateInterval(gun))
@@ -489,7 +535,11 @@ class Ac130Gunnery(private val boss: Ac130BossEntity) {
         if (now < st.pauseUntil) return
         if (st.burstEnd == 0) {
             st.burstEnd = now + min(MAX_CANNON_BURST_TICKS, between(CANNON_BURST_MIN, CANNON_BURST_MAX))
+            boss.thought.event("gunnery.fireCannon") {
+                "M61 burst of ${st.burstEnd - now} ticks, rounds left ${ammoLeft(gun).let { if (it == Int.MAX_VALUE) "unlimited" else "$it" }}"
+            }
             if (boss.getRandom().nextInt(100) < Ac130Config.LONG_BURST_TARGET_SWITCH_CHANCE.get()) {
+                boss.thought.event("gunnery.fireCannon") { "long burst: asking for a new target" }
                 onLongBurstStart()
             }
         }
@@ -512,6 +562,12 @@ class Ac130Gunnery(private val boss: Ac130BossEntity) {
         val uuid: UUID? = null
         val position: Vec3? = null
         boss.vehicleShoot(gunner, uuid, position)
+        // The cannon logs once per burst (see fireCannon); the slow guns log every shot.
+        if (gun != Ac130Gun.M61) {
+            boss.thought.event("gunnery.shoot") {
+                "${gun.name} fired, rounds left ${ammoLeft(gun).let { if (it == Int.MAX_VALUE) "unlimited" else "${it - 1}" }}"
+            }
+        }
         ventGun(gun)
         consumeAmmo(gun)
         st.nextShot = now + max(1, interval)

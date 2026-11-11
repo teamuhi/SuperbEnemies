@@ -2,7 +2,6 @@ package com.teamuhi.superbenemies.entity.dummy.ai
 
 import com.teamuhi.superbenemies.config.DummyMovement
 import com.teamuhi.superbenemies.entity.dummy.HumanoidDummyEntity
-import net.minecraft.core.BlockPos
 import net.minecraft.world.entity.ai.goal.Goal
 import net.minecraft.world.level.pathfinder.Path
 import java.util.EnumSet
@@ -53,12 +52,18 @@ class DummyRoamGoal(private val dummy: HumanoidDummyEntity) : Goal() {
 
     override fun canUse(): Boolean {
         if (dummy.isPassenger || !dummy.isAlive) return false
-        return dummy.settings.movement() == DummyMovement.ROAM && dummy.tickCount >= dummy.forcedStrafeUntil
+        val roaming = dummy.settings.movement() == DummyMovement.ROAM
+        val fallback = dummy.tickCount < dummy.forcedStrafeUntil
+        dummy.thought.think("roam.canUse") {
+            if (!roaming) "no: movement mode is not ROAM" else if (fallback) "no: strafing as the no-cover fallback" else "yes: roaming"
+        }
+        return roaming && !fallback
     }
 
     override fun canContinueToUse(): Boolean = canUse()
 
     override fun start() {
+        dummy.thought.event("roam.start") { "starting to roam" }
         phase = Phase.PAUSE
         pauseUntil = dummy.tickCount // first spot straight away
         sprintLeg = false
@@ -66,6 +71,7 @@ class DummyRoamGoal(private val dummy: HumanoidDummyEntity) : Goal() {
     }
 
     override fun stop() {
+        dummy.thought.event("roam.stop") { "roaming over" }
         dummy.roaming = false
         dummy.navigation.stop()
         dummy.isSprinting = false
@@ -89,9 +95,15 @@ class DummyRoamGoal(private val dummy: HumanoidDummyEntity) : Goal() {
         val now = dummy.tickCount
         // The pause option was lowered while waiting: do not sit out the old, longer wait.
         pauseUntil = minOf(pauseUntil, now + dummy.settings.roamPauseSeconds() * 20)
-        if (now < pauseUntil) return
+        if (now < pauseUntil) {
+            dummy.thought.think("roam.tickPause") { "pausing between legs" }
+            return
+        }
         deferred = false
-        if (!startLeg() && !deferred) enterPause(NO_SPOT_PAUSE_TICKS)
+        if (!startLeg() && !deferred) {
+            dummy.thought.event("roam.tickPause") { "no reachable spot, waiting a moment" }
+            enterPause(NO_SPOT_PAUSE_TICKS)
+        }
     }
 
     private fun tickWalk() {
@@ -103,14 +115,15 @@ class DummyRoamGoal(private val dummy: HumanoidDummyEntity) : Goal() {
         val sprint = sprintLeg && dummy.settings.sprinting() && hypot(velocity.x, velocity.z) > SPRINT_MIN_SPEED
         if (dummy.isSprinting != sprint) dummy.isSprinting = sprint
 
+        dummy.thought.think("roam.tickWalk") { "walking to a roam spot${if (sprint) ", sprinting" else ""}" }
         if (dummy.navigation.isDone || now > legDeadline) {
-            endLeg()
+            endLeg(if (dummy.navigation.isDone) "arrived" else "leg timed out")
             return
         }
         if (now >= stuckCheckTick) {
             val moved = dummy.distanceToSqr(stuckX, stuckY, stuckZ)
             if (moved < STUCK_DISTANCE * STUCK_DISTANCE) {
-                endLeg()
+                endLeg("stuck")
                 return
             }
             rememberPosition()
@@ -125,10 +138,12 @@ class DummyRoamGoal(private val dummy: HumanoidDummyEntity) : Goal() {
         legDeadline = dummy.tickCount + LEG_TIMEOUT_TICKS
         sprintLeg = dummy.settings.sprinting() && dummy.getRandom().nextInt(100) < SPRINT_LEG_PERCENT
         rememberPosition()
+        dummy.thought.event("roam.startLeg") { "roaming to ${path.target.toShortString()}${if (sprintLeg) ", sprinting" else ""}" }
         return true
     }
 
-    private fun endLeg() {
+    private fun endLeg(why: String) {
+        dummy.thought.event("roam.endLeg") { "leg ended: $why" }
         dummy.navigation.stop()
         dummy.isSprinting = false
         sprintLeg = false
@@ -169,7 +184,7 @@ class DummyRoamGoal(private val dummy: HumanoidDummyEntity) : Goal() {
             val x = floor(dummy.x + cos(angle) * distance).toInt()
             val z = floor(dummy.z + sin(angle) * distance).toInt()
             if (anchor != null && hypot(x + 0.5 - anchor.x, z + 0.5 - anchor.z) > ROAM_LEASH) return@repeat
-            val spot = standingSpot(x, z) ?: return@repeat
+            val spot = DummyAi.standingSpot(dummy, x, z) ?: return@repeat
             // Out of path searches for this tick (other dummies used them): try the whole search again next tick.
             if (!DummyAi.pathfinds.tryTake(dummy.level())) {
                 deferred = true
@@ -177,31 +192,6 @@ class DummyRoamGoal(private val dummy: HumanoidDummyEntity) : Goal() {
             }
             val path = dummy.navigation.createPath(spot, 1)
             if (path != null && path.canReach()) return path
-        }
-        return null
-    }
-
-    /**
-     * The nearest-to-the-dummy's-height block in column ([x], [z]) with a solid, dry floor under it and two free, dry
-     * blocks for the body, trying heights from [Y_OFFSETS] (up to 4 above and 6 below the dummy). Null in an unloaded chunk or when
-     * the column has no such block.
-     */
-    private fun standingSpot(x: Int, z: Int): BlockPos? {
-        val level = dummy.level()
-        val cursor = BlockPos.MutableBlockPos()
-        if (!level.isLoaded(cursor.set(x, dummy.blockPosition().y, z))) return null
-        val base = dummy.blockPosition().y
-        // Closest to the dummy's own height first: indoors that is the floor it stands on, not the roof above.
-        for (offset in Y_OFFSETS) {
-            val y = base + offset
-            if (y - 1 < level.minBuildHeight || y + 1 >= level.maxBuildHeight) continue
-            val floor = level.getBlockState(cursor.set(x, y - 1, z))
-            if (floor.getCollisionShape(level, cursor).isEmpty || !floor.fluidState.isEmpty) continue
-            val feet = level.getBlockState(cursor.set(x, y, z))
-            if (!feet.getCollisionShape(level, cursor).isEmpty || !feet.fluidState.isEmpty) continue
-            val head = level.getBlockState(cursor.set(x, y + 1, z))
-            if (!head.getCollisionShape(level, cursor).isEmpty || !head.fluidState.isEmpty) continue
-            return BlockPos(x, y, z)
         }
         return null
     }
@@ -214,9 +204,6 @@ class DummyRoamGoal(private val dummy: HumanoidDummyEntity) : Goal() {
         /** Keep this far (blocks) from the anchor; under the entity's own 64 block re-anchor limit. */
         const val ROAM_LEASH = 48.0
         const val HOME_CONE_RADIANS = Math.PI / 3.0
-
-        /** Floor heights tried around the dummy's own, nearest first (up to 4 above and 6 below). */
-        val Y_OFFSETS = intArrayOf(0, 1, -1, 2, -2, 3, -3, 4, -4, -5, -6)
 
         const val NO_SPOT_PAUSE_TICKS = 20
 
